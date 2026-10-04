@@ -527,6 +527,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_KOLIBRI1   = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +538,8 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_KOLIBRI1 = 7,
+    DS4_VARIANT_KOLIBRI1_MINI = 8,
 } ds4_variant;
 
 typedef struct {
@@ -877,6 +880,59 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* Kolibri-1: 50 identical layers, every one a MoE block of 384 routed
+ * experts (top-6) plus one shared expert of width 512. Attention repeats four
+ * sliding-window GQA layers (513 tokens, RoPE) with one full GQA layer that
+ * carries no positional encoding at all. QK get per-head RMSNorm, and each
+ * sublayer output is normalized again before the residual add. */
+static const ds4_shape DS4_SHAPE_KOLIBRI1 = {
+    .name = "Kolibri-1",
+    .family = DS4_MODEL_FAMILY_KOLIBRI1,
+    .variant = DS4_VARIANT_KOLIBRI1,
+    .n_layer = 50,
+    .n_embd = 2560,
+    .n_vocab = 128000,
+    .n_head = 48,
+    .n_head_kv = 4,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,
+    .n_expert = 384,
+    .n_expert_used = 6,
+    .n_expert_shared = 1,
+    .n_ff_exp = 512,
+    .n_swa = 513,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000.0f,
+    .rope_orig_ctx = 262144,
+};
+
+/* Synthetic fixture: same structure at toy widths, real tokenizer. The odd
+ * window length keeps the sliding-window ring logic honest. */
+static const ds4_shape DS4_SHAPE_KOLIBRI1_MINI = {
+    .name = "Kolibri-1 mini",
+    .family = DS4_MODEL_FAMILY_KOLIBRI1,
+    .variant = DS4_VARIANT_KOLIBRI1_MINI,
+    .n_layer = 5,
+    .n_embd = 64,
+    .n_vocab = 128000,
+    .n_head = 4,
+    .n_head_kv = 2,
+    .n_head_dim = 16,
+    .n_value_dim = 16,
+    .n_rot = 16,
+    .n_expert = 8,
+    .n_expert_used = 2,
+    .n_expert_shared = 1,
+    .n_ff_exp = 32,
+    .n_swa = 33,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000.0f,
+    .rope_orig_ctx = 4096,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -1024,6 +1080,16 @@ static bool ds4_qwen4_layer_is_ple(uint32_t il) {
 static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
     return ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0 &&
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+}
+
+static bool ds4_model_is_kolibri1(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1;
+}
+
+/* Every fifth layer attends to the whole context without positional encoding;
+ * the four before it use the sliding window and RoPE. */
+static bool ds4_kolibri1_layer_is_full(uint32_t il) {
+    return ds4_model_is_kolibri1() && (il + 1u) % 5u == 0u;
 }
 
 static int g_ds4_lock_fd = -1;
@@ -3182,6 +3248,17 @@ static void model_summary(const ds4_model *m) {
         model_get_u32(m, "deepseek41.num_experts_per_tok", &n_expert_used);
     }
 
+    if (ds4_streq(arch, "kolibri1")) {
+        model_get_u32(m, "kolibri1.block_count", &layers);
+        model_get_u64_compat(m, "kolibri1.context_length", &ctx_train);
+        model_get_u32(m, "kolibri1.attention.head_count", &n_head);
+        model_get_u32(m, "kolibri1.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "kolibri1.attention.key_length", &head_dim);
+        model_get_u32(m, "kolibri1.attention.sliding_window", &n_swa);
+        model_get_u32(m, "kolibri1.expert_count", &n_expert);
+        model_get_u32(m, "kolibri1.expert_used_count", &n_expert_used);
+    }
+
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
@@ -4708,6 +4785,9 @@ typedef struct {
     ds4_tensor *nextn_hc_head_norm;
     ds4_tensor *nextn_hc_head_down;
     ds4_tensor *nextn_hc_head_up;
+    /* Kolibri-1: RMSNorm applied to each sublayer output before the residual */
+    ds4_tensor *post_attn_norm;
+    ds4_tensor *post_ffn_norm;
 } ds4_layer_weights;
 
 typedef struct {
@@ -5341,7 +5421,8 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        ds4_model_is_kolibri1()) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -5357,7 +5438,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        ds4_model_is_kolibri1()) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5474,16 +5556,17 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
-static bool tensor_type_is_qwen4_dense(uint32_t type) {
+/* Dense projections for the MoE families: Q8_0 and F16 from our recipes,
+ * BF16 and Q4_0 from upstream GGUFs, F32 for the CPU reference and fixtures. */
+static bool tensor_type_is_moe_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
            type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
 }
 
-static void tensor_expect_qwen4_dense_layout(
+static void tensor_expect_moe_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (!tensor_type_is_qwen4_dense(t->type)) {
+    if (!tensor_type_is_moe_dense(t->type)) {
         fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, F16, BF16 or F32\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -5491,7 +5574,7 @@ static void tensor_expect_qwen4_dense_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
-static void tensor_expect_qwen4_expert_layout(
+static void tensor_expect_moe_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
@@ -5526,7 +5609,7 @@ static void weights_validate_qwen4_layout(
 
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
     if (w->token_embd) {
-        tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        tensor_expect_moe_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
     if (require_token_embd && !w->ple_embd)
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
@@ -5551,9 +5634,9 @@ static void weights_validate_qwen4_layout(
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
     if (have_output) {
         tensor_expect_layout(w->output_hc_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-        tensor_expect_qwen4_dense_layout(w->output_hc_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-        tensor_expect_qwen4_dense_layout(w->output_hc_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        tensor_expect_moe_dense_layout(w->output_hc_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_moe_dense_layout(w->output_hc_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_moe_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -5563,39 +5646,39 @@ static void weights_validate_qwen4_layout(
             exit(1);
         }
         tensor_expect_layout(l->hc_attn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_attn_inject, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_moe_dense_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_moe_dense_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_moe_dense_layout(l->hc_attn_inject, 2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(l->hc_ffn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_moe_dense_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_moe_dense_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_moe_dense_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
 
         if (ds4_qwen4_layer_is_linear(il)) {
-            tensor_expect_qwen4_dense_layout(l->lin_qkv, 2, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_gate, 2, DS4_N_EMBD, lin_v_dim, 0);
+            tensor_expect_moe_dense_layout(l->lin_qkv, 2, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim, 0);
+            tensor_expect_moe_dense_layout(l->lin_gate, 2, DS4_N_EMBD, lin_v_dim, 0);
             tensor_expect_layout(l->lin_conv, DS4_TENSOR_F32, 2, DS4_N_LIN_CONV, 2u * lin_k_dim + lin_v_dim, 0);
             tensor_expect_layout(l->lin_dt_bias, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
             tensor_expect_layout(l->lin_a, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_moe_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_moe_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
             tensor_expect_layout(l->lin_norm, DS4_TENSOR_F32, 1, DS4_N_LIN_HEAD_DIM, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
         } else {
-            tensor_expect_qwen4_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
+            tensor_expect_moe_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_moe_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_moe_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
             tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->indexer_q_proj, 2, DS4_N_EMBD, index_q_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->indexer_k_proj, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
+            tensor_expect_moe_dense_layout(l->indexer_q_proj, 2, DS4_N_EMBD, index_q_dim, 0);
+            tensor_expect_moe_dense_layout(l->indexer_k_proj, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
             tensor_expect_layout(l->indexer_q_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
         }
         if (ds4_qwen4_layer_is_ple(il)) {
-            tensor_expect_qwen4_dense_layout(l->ple_key, 2, DS4_N_EMBD, hc_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->ple_value, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->ple_key, 2, DS4_N_EMBD, hc_dim, 0);
+            tensor_expect_moe_dense_layout(l->ple_value, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
             tensor_expect_layout(l->ple_norm_key, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
             tensor_expect_layout(l->ple_norm_query, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
             tensor_expect_layout(l->ple_norm_conv, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
@@ -5603,13 +5686,13 @@ static void weights_validate_qwen4_layout(
                                  2, DS4_N_PLE_CONV, hc_dim, 0);
         }
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
          * Activations remain 640 wide; only the weight row stride is padded. */
         const uint32_t down_width = l->ffn_down_exps->type == DS4_TENSOR_Q2_K ?
             (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
-        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -5620,16 +5703,16 @@ static void weights_validate_qwen4_layout(
         } else {
             tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 2, DS4_N_EMBD, 1, 0);
         }
-        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_moe_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (ds4_qwen4_layer_is_nextn(il)) {
-            tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
             tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
             tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
             tensor_expect_layout(l->nextn_hc_head_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->nextn_hc_head_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-            tensor_expect_qwen4_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+            tensor_expect_moe_dense_layout(l->nextn_hc_head_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+            tensor_expect_moe_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         }
     }
 }
@@ -5880,12 +5963,82 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+static bool weights_kolibri1_layer_has_required(const ds4_layer_weights *l) {
+    if (!l) return false;
+    return l->attn_norm && l->post_attn_norm && l->ffn_norm && l->post_ffn_norm &&
+           l->attn_q && l->attn_k && l->attn_v && l->attn_output &&
+           l->attn_q_norm && l->attn_k_norm && l->ffn_gate_inp && l->ffn_exp_probs_b &&
+           l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+           l->ffn_gate_shexp && l->ffn_up_shexp && l->ffn_down_shexp;
+}
+
+static void weights_validate_kolibri1_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+    if (!w) ds4_die("internal error: missing weights while validating Kolibri layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in Kolibri weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in Kolibri weight layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_moe_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_moe_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_kolibri1_layer_has_required(l)) {
+            fprintf(stderr, "ds4: required Kolibri tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->post_attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->post_ffn_norm,  DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_moe_dense_layout(l->attn_q,      2, DS4_N_EMBD, q_dim, 0);
+        tensor_expect_moe_dense_layout(l->attn_k,      2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_moe_dense_layout(l->attn_v,      2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_moe_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->ffn_gate_inp,    DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+        tensor_expect_moe_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        tensor_expect_moe_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (ds4_model_is_kolibri1()) {
+        weights_validate_kolibri1_layout(w, layer_start, layer_end,
+                                         require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -7147,6 +7300,66 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Kolibri-1 GGUFs carry the released architecture in `kolibri1.*` metadata.
+ * The converter freezes those keys, so every value is checked against the
+ * compiled shape instead of being trusted for scheduling decisions. */
+static void config_validate_kolibri1_model(const ds4_model *m) {
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_embd = required_u32(m, "kolibri1.embedding_length");
+    if (n_embd == DS4_SHAPE_KOLIBRI1.n_embd) {
+        g_ds4_shape = DS4_SHAPE_KOLIBRI1;
+    } else if (n_embd == DS4_SHAPE_KOLIBRI1_MINI.n_embd) {
+        g_ds4_shape = DS4_SHAPE_KOLIBRI1_MINI;
+    } else {
+        fprintf(stderr, "ds4: unsupported kolibri1 embedding_length %u\n", n_embd);
+        exit(1);
+    }
+
+    const struct { const char *key; uint32_t value; } ints[] = {
+        {"block_count", DS4_N_LAYER},
+        {"context_length", DS4_ROPE_ORIG_CTX},
+        {"feed_forward_length", DS4_N_FF_EXP},
+        {"expert_count", DS4_N_EXPERT},
+        {"expert_used_count", DS4_N_EXPERT_USED},
+        {"expert_shared_count", DS4_N_EXPERT_SHARED},
+        {"attention.head_count", DS4_N_HEAD},
+        {"attention.head_count_kv", DS4_N_HEAD_KV},
+        {"attention.key_length", DS4_N_HEAD_DIM},
+        {"attention.value_length", DS4_N_VALUE_DIM},
+        {"attention.sliding_window", DS4_N_SWA},
+        {"rope.dimension_count", DS4_N_ROT},
+    };
+    for (size_t i = 0; i < sizeof(ints) / sizeof(ints[0]); i++) {
+        char key[128];
+        snprintf(key, sizeof(key), "kolibri1.%s", ints[i].key);
+        config_expect_u32(key, required_u32(m, key), ints[i].value);
+    }
+    config_expect_f32("kolibri1.attention.layer_norm_rms_epsilon",
+                      required_f32(m, "kolibri1.attention.layer_norm_rms_epsilon"),
+                      DS4_RMS_EPS);
+    config_expect_f32("kolibri1.rope.freq_base",
+                      required_f32(m, "kolibri1.rope.freq_base"),
+                      DS4_ROPE_FREQ_BASE);
+    config_expect_f32("kolibri1.expert_weights_scale",
+                      required_f32(m, "kolibri1.expert_weights_scale"),
+                      DS4_EXPERT_WEIGHT_SCALE);
+    config_expect_bool("kolibri1.expert_weights_norm",
+                       required_bool(m, "kolibri1.expert_weights_norm"), false);
+    config_expect_bool("kolibri1.router.expert_bias",
+                       required_bool(m, "kolibri1.router.expert_bias"), true);
+    config_expect_bool("kolibri1.attention.full_attention_rope",
+                       required_bool(m, "kolibri1.attention.full_attention_rope"), false);
+
+    /* The 4:1 pattern is fixed, but the array is what the file declares, so
+     * a converted model with a different schedule is rejected here. */
+    uint32_t layer_types[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        layer_types[il] = ds4_kolibri1_layer_is_full(il) ? 1u : 0u;
+    config_expect_u32_array(m, "kolibri1.attention.layer_types",
+                            layer_types, DS4_N_LAYER);
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7165,6 +7378,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "kolibri1")) {
+            config_validate_kolibri1_model(m);
             return;
         }
     }
@@ -7656,7 +7873,8 @@ static void weights_bind_output(
             w->output         = model_find_tensor(m, "output.weight");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        ds4_model_is_kolibri1()) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -7819,7 +8037,34 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+/* Kolibri-1 tensors: GQA projections with per-head QK norms, the four
+ * sandwich norms, and one MoE block per layer. Every layer is routed. */
+static void weights_bind_kolibri1_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm      = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->post_attn_norm = required_tensorf(m, "blk.%u.post_attn_norm.weight", il);
+    l->ffn_norm       = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->post_ffn_norm  = required_tensorf(m, "blk.%u.post_ffn_norm.weight", il);
+    l->attn_q         = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k         = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v         = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_q_norm    = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k_norm    = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->ffn_gate_inp   = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_gate_exps  = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps    = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps  = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp   = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (ds4_model_is_kolibri1()) {
+        weights_bind_kolibri1_layer(l, m, il);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
         return;
@@ -43069,12 +43314,15 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
     return c;
 }
 
-/* Qwen3.8 pre-tokenization (tokenizer.ggml.pre = "qwen35"), the ordered
- * alternation
- *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
- *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
- * with the Unicode classes generated from the `regex` module. */
-static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+/* Shared ChatML-style pre-tokenization for Qwen3.8
+ * (tokenizer.ggml.pre = "qwen35") and Kolibri-1 ("kolibri1"), which release the
+ * same ordered alternation
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} |
+ *    ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * The only difference is combining marks: Qwen counts \p{M} inside letter runs
+ * and its punctuation class, Kolibri splits them out. */
+static void bpe_tokenize_text_chatml(const ds4_vocab *vocab, const char *text,
+                                     token_vec *out, bool marks) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -43102,20 +43350,20 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
             }
         }
 
-        /* an optional non-letter prefix, then a run of letters and marks */
+        /* an optional non-letter prefix, then a run of letters (and marks) */
         {
             uint64_t run = UINT64_MAX;
-            if (cur.letter || cur.mark) {
+            if (cur.letter || (marks && cur.mark)) {
                 run = cur.next;
             } else if (cur.cp != '\r' && cur.cp != '\n' && !cur.number) {
                 qwen4_char_info n1 = qwen4_char_at(text, len, cur.next);
-                if (n1.valid && (n1.letter || n1.mark)) run = n1.next;
+                if (n1.valid && (n1.letter || (marks && n1.mark))) run = n1.next;
             }
             if (run != UINT64_MAX) {
                 pos = run;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || !(scan.letter || scan.mark)) break;
+                    if (!scan.valid || !(scan.letter || (marks && scan.mark))) break;
                     pos = scan.next;
                 }
                 bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
@@ -43136,11 +43384,13 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
                 punct_pos = cur.next;
                 punct = qwen4_char_at(text, len, punct_pos);
             }
-            if (punct.valid && !punct.space && !punct.letter && !punct.mark && !punct.number) {
+            if (punct.valid && !punct.space && !punct.letter && !punct.number &&
+                !(marks && punct.mark)) {
                 pos = punct_pos;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || scan.space || scan.letter || scan.mark || scan.number) break;
+                    if (!scan.valid || scan.space || scan.letter || scan.number ||
+                        (marks && scan.mark)) break;
                     pos = scan.next;
                 }
                 while (pos < len) {
@@ -43183,6 +43433,16 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_text_chatml(vocab, text, out, true);
+}
+
+/* Kolibri-1 splits combining marks out of letter runs, so German text with
+ * decomposed forms tokenizes as its released pre-tokenizer does. */
+static void bpe_tokenize_text_kolibri1(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_text_chatml(vocab, text, out, false);
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -43208,6 +43468,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (ds4_model_is_qwen4()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
+    }
+    if (ds4_model_is_kolibri1()) {
+        bpe_tokenize_text_kolibri1(vocab, text, out);
         return;
     }
 
@@ -43336,6 +43600,33 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     if (ds4_model_is_qwen4()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
          * second generation stop. */
+        vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
+        vocab->im_end_id = vocab_lookup(vocab, "<|im_end|>");
+        vocab->endoftext_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->bos_id = -1;
+        vocab->eos_id = vocab->im_end_id;
+        vocab->system_id = -1;
+        vocab->user_id = -1;
+        vocab->assistant_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
+    if (ds4_model_is_kolibri1()) {
+        /* ChatML without BOS. <think> is an ordinary added token, and
+         * 127901 doubles as a second generation stop. */
         vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
         vocab->im_end_id = vocab_lookup(vocab, "<|im_end|>");
         vocab->endoftext_id = vocab_lookup(vocab, "<|endoftext|>");
@@ -70578,6 +70869,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_kolibri1() && !opt->inspect_only) {
+        /* The family, tokenizer and layout are wired, but no CPU reference or
+         * Metal graph exists yet. Refuse loudly instead of running the V4
+         * path against these tensors. */
+        fprintf(stderr, "ds4: Kolibri-1 inference is not implemented yet; "
+                        "this build loads and inspects Kolibri GGUFs only\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -70994,6 +71295,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (opt->inspect_only) {
+        if (ds4_model_is_kolibri1()) {
+            /* There is no Kolibri inference path yet, so inspection is the
+             * one place that binds and validates the converted layout. */
+            weights_bind(&e->weights, &e->model, false, 0, 0, true, false);
+        }
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
             model_open(&e->mtp_model, opt->mtp_path, false, false);

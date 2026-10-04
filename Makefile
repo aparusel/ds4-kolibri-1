@@ -730,6 +730,19 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
+# Kolibri-1 loader and pre-tokenizer check against a synthetic fixture.  Only
+# the released tokenizer files are needed, not the weights.
+KOLIBRI1_TOKENIZER_DIR ?=
+KOLIBRI1_MINI_GGUF ?= gguf/Kolibri-1-mini.gguf
+
+.PHONY: test-kolibri1-gguf
+test-kolibri1-gguf: ds4
+	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
+		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
+	python3 tests/make_kolibri1_mini.py --tokenizer "$(KOLIBRI1_TOKENIZER_DIR)" \
+		--out "$(KOLIBRI1_MINI_GGUF)"
+	./ds4 -m "$(KOLIBRI1_MINI_GGUF)" --inspect
+
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
