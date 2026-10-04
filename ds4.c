@@ -1232,6 +1232,34 @@ typedef struct {
     float *output_norm;
 } ds4_cpu_decode_scratch;
 
+typedef struct {
+    float *k;          /* rows x kv_dim; rows 0..count-1 hold the current span */
+    float *v;
+    uint32_t rows;     /* window for sliding layers, context for full ones */
+} ds4_kolibri1_kv_layer;
+
+typedef struct {
+    ds4_kolibri1_kv_layer layer[DS4_MAX_LAYER];
+    uint32_t ctx;
+    uint32_t filled;
+} ds4_kolibri1_kv;
+
+typedef struct {
+    float *residual;
+    float *x;
+    float *q;
+    float *k;
+    float *v;
+    float *context;
+    float *attn;
+    float *moe;
+    float *router;
+    float *scores;
+    float *ff_a;
+    float *ff_b;
+    uint32_t selected[DS4_MAX_EXPERT_USED];
+} ds4_kolibri1_cpu_scratch;
+
 static const uint8_t kmask_iq2xs[8] = {
     1, 2, 4, 8, 16, 32, 64, 128
 };
@@ -57632,7 +57660,8 @@ static int generate_glm_metal_argmax(
 }
 #endif
 
-static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
+/* Row dequantization for the CPU reference paths, shared by every MoE family. */
+static void ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
@@ -58967,7 +58996,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         float *dst = row + (uint64_t)t * hc_dim;
         const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
         if (img) memcpy(dst, img, E * sizeof(float));
-        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
+        else ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
         for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);
         g->host_pos3[(uint64_t)t * 4u + 3u] = 0;
@@ -59341,7 +59370,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const ds4_layer_weights *l = &w->layer[il];
     for (uint32_t t = 0; t < T; t++) {
         if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
+        ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
     }
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
@@ -59435,7 +59464,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
+    ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, emb_bytes) ||
         !glm_graph_begin_commands_if_needed()) return false;
     ds4_gpu_tensor *R_save = g->R;
@@ -60558,6 +60587,8 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    ds4_kolibri1_kv kolibri1_cpu;
+    ds4_kolibri1_cpu_scratch kolibri1_cpu_scratch;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -61644,6 +61675,7 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 static void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
+    s->kolibri1_cpu.filled = 0;
 }
 
 static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_end) {
@@ -67294,7 +67326,7 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
  * gammas except ssm_norm are folded to 1+w, ssm_a holds -exp(A_log).
  * --------------------------------------------------------------------- */
 
-static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
+static void ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
     case DS4_TENSOR_F32:
@@ -67428,7 +67460,7 @@ static void qwen4_ref_matvec_rows(
     const uint64_t n = w->dim[0];
     float *row = xmalloc(n * sizeof(float));
     for (uint64_t r = 0; r < n_rows; r++) {
-        qwen4_ref_row(m, w, row0 + r, row);
+        ref_row(m, w, row0 + r, row);
         double acc = 0.0;
         for (uint64_t i = 0; i < n; i++) acc += (double)row[i] * x[i];
         out[r] = (float)acc;
@@ -67440,8 +67472,8 @@ static void qwen4_ref_matvec(const ds4_model *m, const ds4_tensor *w, const floa
     qwen4_ref_matvec_rows(m, w, 0, w->ndim >= 2 ? w->dim[1] : 1u, x, out);
 }
 
-static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t) {
-    if (t->type != DS4_TENSOR_F32) ds4_die("qwen4 reference: expected an F32 tensor");
+static const float *ref_f32(const ds4_model *m, const ds4_tensor *t) {
+    if (t->type != DS4_TENSOR_F32) ds4_die("CPU reference: expected an F32 tensor");
     return (const float *)tensor_data(m, t);
 }
 
@@ -67531,7 +67563,7 @@ static void qwen4_ref_hc_mix(
     float *xn = xmalloc(hc_dim * sizeof(float));
     float *lo = xmalloc(rank * sizeof(float));
     float *gate = xmalloc(hc_dim * sizeof(float));
-    qwen4_ref_grouped_rms(xn, R, qwen4_ref_f32(m, norm), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(xn, R, ref_f32(m, norm), hc, E, DS4_RMS_EPS);
     qwen4_ref_matvec(m, down, xn, lo);
     for (uint32_t r = 0; r < rank; r++) lo[r] = silu(lo[r] / (float)hc);
     qwen4_ref_matvec(m, up, lo, gate);
@@ -67602,8 +67634,8 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
     float *gated = xmalloc(hc_dim * sizeof(float));
     float *normed = xmalloc(hc_dim * sizeof(float));
     qwen4_ref_matvec(m, l->ple_key, emb, key);
-    qwen4_ref_grouped_rms(keyn, key, qwen4_ref_f32(m, l->ple_norm_key), hc, E, DS4_RMS_EPS);
-    qwen4_ref_grouped_rms(query, R, qwen4_ref_f32(m, l->ple_norm_query), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(keyn, key, ref_f32(m, l->ple_norm_key), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(query, R, ref_f32(m, l->ple_norm_query), hc, E, DS4_RMS_EPS);
     qwen4_ref_matvec(m, l->ple_value, emb, value);
     for (uint32_t s = 0; s < hc; s++) {
         double dot = 0.0;
@@ -67613,17 +67645,17 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
         g = sigmoid_stable(g > 0.0f ? mag : (g < 0.0f ? -mag : 0.0f));
         for (uint32_t d = 0; d < E; d++) gated[s * E + d] = g * value[d];
     }
-    qwen4_ref_grouped_rms(normed, gated, qwen4_ref_f32(m, l->ple_norm_conv), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(normed, gated, ref_f32(m, l->ple_norm_conv), hc, E, DS4_RMS_EPS);
 
     /* depthwise conv, kernel K dilated by the n-gram size: tap k reads (K-1-k)*dil back */
     float *cw_f16 = NULL;
     const float *cw;
     if (l->ple_conv->type == DS4_TENSOR_F16) {
         cw_f16 = xmalloc((size_t)hc_dim * DS4_N_PLE_CONV * sizeof(float));
-        for (uint32_t c = 0; c < hc_dim; c++) qwen4_ref_row(m, l->ple_conv, c, cw_f16 + (uint64_t)c * DS4_N_PLE_CONV);
+        for (uint32_t c = 0; c < hc_dim; c++) ref_row(m, l->ple_conv, c, cw_f16 + (uint64_t)c * DS4_N_PLE_CONV);
         cw = cw_f16;
     } else {
-        cw = qwen4_ref_f32(m, l->ple_conv);
+        cw = ref_f32(m, l->ple_conv);
     }
     for (uint32_t c = 0; c < hc_dim; c++) {
         double acc = 0.0;
@@ -67657,7 +67689,7 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
     qwen4_ref_matvec(m, l->lin_alpha, x, a);
 
     float *hist = st->lin_hist + (uint64_t)il * (K - 1u) * conv_dim;
-    const float *cw = qwen4_ref_f32(m, l->lin_conv);
+    const float *cw = ref_f32(m, l->lin_conv);
     for (uint32_t c = 0; c < conv_dim; c++) {
         double acc = (double)cw[(uint64_t)c * K + (K - 1u)] * qkv[c];
         for (uint32_t k = 0; k + 1u < K; k++) acc += (double)cw[(uint64_t)c * K + k] * hist[(uint64_t)k * conv_dim + c];
@@ -67673,9 +67705,9 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
         qwen4_ref_l2norm(k + h * D, D);
         for (uint32_t i = 0; i < D; i++) q[h * D + i] *= qscale;
     }
-    const float *A = qwen4_ref_f32(m, l->lin_a);
-    const float *dt = qwen4_ref_f32(m, l->lin_dt_bias);
-    const float *nw = qwen4_ref_f32(m, l->lin_norm);
+    const float *A = ref_f32(m, l->lin_a);
+    const float *dt = ref_f32(m, l->lin_dt_bias);
+    const float *nw = ref_f32(m, l->lin_norm);
     for (uint32_t j = 0; j < Hv; j++) {
         const uint32_t kh = j % Hk;
         const float g = expf(A[j] * qwen4_ref_softplus(a[j] + dt[j]));
@@ -67725,8 +67757,8 @@ static uint32_t qwen4_ref_select(const ds4_model *m, const ds4_layer_weights *l,
         free(qi);
         return n_sel;
     }
-    const float *gq = qwen4_ref_f32(m, l->indexer_q_norm);
-    const float *gk = qwen4_ref_f32(m, l->indexer_k_norm);
+    const float *gq = ref_f32(m, l->indexer_q_norm);
+    const float *gk = ref_f32(m, l->indexer_k_norm);
     for (uint32_t h = 0; h < Hi; h++) {
         float tmp[DS4_MAX_INDEXER_HEAD_DIM];
         qwen4_ref_rms(tmp, qi + h * Di, gq, Di, DS4_RMS_EPS);
@@ -67785,8 +67817,8 @@ static void qwen4_ref_attention(const ds4_model *m, const ds4_layer_weights *l, 
     qwen4_ref_matvec(m, l->attn_q, x, qg);
     qwen4_ref_matvec(m, l->attn_k, x, kc);
     qwen4_ref_matvec(m, l->attn_v, x, vc);
-    const float *gqn = qwen4_ref_f32(m, l->attn_q_norm);
-    const float *gkn = qwen4_ref_f32(m, l->attn_k_norm);
+    const float *gqn = ref_f32(m, l->attn_q_norm);
+    const float *gkn = ref_f32(m, l->attn_k_norm);
     for (uint32_t h = 0; h < H; h++) {
         qwen4_ref_rms(q + h * D, qg + (uint64_t)h * 2u * D, gqn, D, DS4_RMS_EPS);
         qwen4_ref_rope(q + h * D, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
@@ -67907,7 +67939,7 @@ static void qwen4_ref_forward_token(const ds4_model *m, const ds4_weights *w, qw
     const ds4_vision_span *fake = qwen4_fake_spans(&n_fake);
     const float *img = n_fake ? qwen4_span_row(fake, n_fake, pos) : NULL;
     if (img) memcpy(R, img, E * sizeof(float));
-    else qwen4_ref_row(m, w->token_embd, (uint64_t)token, R);
+    else ref_row(m, w->token_embd, (uint64_t)token, R);
     for (uint32_t s = 1; s < hc; s++) memcpy(R + (uint64_t)s * E, R, E * sizeof(float));
     qwen4_mrope_pos(fake, n_fake, pos, &st->mrope_delta, st->pos3 + (uint64_t)pos * 3u);
     for (uint32_t il = 0; il < n_trunk; il++) {
@@ -67939,9 +67971,9 @@ static void qwen4_ref_mtp(const ds4_model *m, const ds4_weights *w, qwen4_ref_st
     float *ep = xmalloc(E * sizeof(float));
     float mixed[DS4_MAX_EMBD], blk[DS4_MAX_EMBD], inj[DS4_MAX_HC];
 
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, e);
-    qwen4_ref_rms(en, e, qwen4_ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
-    qwen4_ref_rms(hn, R_pre, qwen4_ref_f32(m, l->nextn_hnorm), hc_dim, DS4_RMS_EPS);
+    ref_row(m, w->token_embd, (uint64_t)next_token, e);
+    qwen4_ref_rms(en, e, ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
+    qwen4_ref_rms(hn, R_pre, ref_f32(m, l->nextn_hnorm), hc_dim, DS4_RMS_EPS);
     /* eh_proj = [W_e | W_h] over concat(e, h): e once, h per stream */
     memcpy(cat, en, E * sizeof(float));
     memset(cat + E, 0, E * sizeof(float));
@@ -68292,6 +68324,308 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
     free(logits);
     free(seq);
     return 0;
+}
+
+/* ================= Kolibri-1 CPU reference =================
+ *
+ * The CPU pass is the correctness reference for the Metal graph, so it stays
+ * plain: one token at a time, F32 accumulation, and exactly the released block
+ * structure. Each pre-norm is a fused add-RMSNorm, so the residual stream
+ * advances there and each sublayer's normalized output joins it at the next
+ * pre-norm:
+ *
+ *   residual += hidden;  x = rmsnorm(residual) * input_layernorm
+ *   attn = o_proj(attend(qk_norm(q), k_norm(k)))
+ *   attn = post_attn_norm(attn);  residual += attn
+ *   x = rmsnorm(residual) * post_attention_layernorm
+ *   y = shared_experts(x) + sum_e sigmoid(router_e) * expert_e(x)
+ *   y = post_ffn_norm(y);  residual += y
+ *
+ * Routing selects the top-k experts on router + expert_bias and weights them
+ * with the unbiased sigmoid. Sliding layers rotate q/k by RoPE over their
+ * window; full layers take no positional encoding at all.
+ */
+
+static void kolibri1_kv_free(ds4_kolibri1_kv *cache) {
+    if (!cache) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        free(cache->layer[il].k);
+        free(cache->layer[il].v);
+        cache->layer[il].k = NULL;
+        cache->layer[il].v = NULL;
+    }
+    cache->ctx = 0;
+    cache->filled = 0;
+}
+
+/* Sliding layers keep exactly one window of rows; full layers keep the whole
+ * context (about 0.5 GB per F32 KV tensor per full layer at 262k on the
+ * released shape). */
+static bool kolibri1_kv_init(ds4_kolibri1_kv *cache, uint32_t ctx) {
+    memset(cache, 0, sizeof(*cache));
+    const uint32_t kv_dim = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? ctx : DS4_N_SWA;
+        if (!rows) ds4_die("Kolibri-1 KV cache needs a positive window");
+        cache->layer[il].k = xmalloc((size_t)rows * kv_dim * sizeof(float));
+        cache->layer[il].v = xmalloc((size_t)rows * kv_dim * sizeof(float));
+        if (!cache->layer[il].k || !cache->layer[il].v) {
+            kolibri1_kv_free(cache);
+            return false;
+        }
+        cache->layer[il].rows = rows;
+    }
+    cache->ctx = ctx;
+    cache->filled = 0;
+    return true;
+}
+
+static void kolibri1_cpu_scratch_free(ds4_kolibri1_cpu_scratch *s) {
+    if (!s) return;
+    free(s->residual);
+    free(s->x);
+    free(s->q);
+    free(s->k);
+    free(s->v);
+    free(s->context);
+    free(s->attn);
+    free(s->moe);
+    free(s->router);
+    free(s->scores);
+    free(s->ff_a);
+    free(s->ff_b);
+    memset(s, 0, sizeof(*s));
+}
+
+static bool kolibri1_cpu_scratch_init(ds4_kolibri1_cpu_scratch *s) {
+    memset(s, 0, sizeof(*s));
+    const size_t embd = (size_t)DS4_N_EMBD * sizeof(float);
+    const size_t q_dim = (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const size_t kv_dim = (size_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    s->residual = xmalloc(embd);
+    s->x = xmalloc(embd);
+    s->attn = xmalloc(embd);
+    s->moe = xmalloc(embd);
+    s->q = xmalloc(q_dim);
+    s->k = xmalloc(kv_dim);
+    s->v = xmalloc(kv_dim);
+    s->context = xmalloc(q_dim);
+    s->router = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
+    /* Attention can span the whole context on full-attention layers, so the
+     * score buffer must cover the context, not just the sliding window. */
+    const uint64_t widest_score = (uint64_t)(DS4_N_SWA > DS4_ROPE_ORIG_CTX ?
+                                             DS4_N_SWA : DS4_ROPE_ORIG_CTX);
+    s->scores = xmalloc((size_t)widest_score * sizeof(float));
+    s->ff_a = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    s->ff_b = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    if (!s->residual || !s->x || !s->attn || !s->moe || !s->q || !s->k ||
+        !s->v || !s->context || !s->router || !s->scores || !s->ff_a || !s->ff_b) {
+        kolibri1_cpu_scratch_free(s);
+        return false;
+    }
+    return true;
+}
+
+/* NeoX-style RoPE over the full head dimension, base from the shape. */
+static void kolibri1_rope(float *vec, uint32_t n_head, uint32_t head_dim, uint32_t pos) {
+    const uint32_t half = head_dim / 2u;
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *v = vec + (uint64_t)h * head_dim;
+        for (uint32_t i = 0; i < half; i++) {
+            const double freq = pow(DS4_ROPE_FREQ_BASE, -2.0 * (double)i / (double)head_dim);
+            const float angle = (float)((double)pos * freq);
+            const float c = cosf(angle), s = sinf(angle);
+            const float x1 = v[i], x2 = v[i + half];
+            v[i] = x1 * c - x2 * s;
+            v[i + half] = x1 * s + x2 * c;
+        }
+    }
+}
+
+/* One routed expert: rows of a GGUF [in, out, n] tensor, expert-major. */
+static void kolibri1_expert_matvec(
+        const ds4_model  *m,
+        const ds4_tensor *t,
+        uint32_t          expert,
+        uint32_t          out_dim,
+        const float      *x,
+        float            *out) {
+    const uint64_t in_dim = t->dim[0];
+    const uint64_t plane = (uint64_t)out_dim * in_dim;
+    const float *base = (const float *)tensor_data(m, t) +
+                        (uint64_t)expert * plane;
+    for (uint32_t r = 0; r < out_dim; r++) {
+        const float *row = base + (uint64_t)r * in_dim;
+        double acc = 0.0;
+        for (uint64_t i = 0; i < in_dim; i++) acc += (double)row[i] * x[i];
+        out[r] = (float)acc;
+    }
+}
+
+/* Top-k on router + bias, insertion ordered so equal scores keep the lower
+ * expert index. Slots are only read once they hold a candidate. */
+static uint32_t kolibri1_route(
+        const float *router,
+        const float *bias,
+        uint32_t      n_expert,
+        uint32_t      top_k,
+        uint32_t     *selected) {
+    float best[DS4_MAX_EXPERT_USED];
+    uint32_t count = 0;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float score = router[e] + bias[e];
+        if (count == top_k && score <= best[top_k - 1u]) continue;
+        uint32_t slot = count < top_k ? count : top_k - 1u;
+        while (slot > 0 && best[slot - 1u] < score) {
+            best[slot] = best[slot - 1u];
+            selected[slot] = selected[slot - 1u];
+            slot--;
+        }
+        best[slot] = score;
+        selected[slot] = e;
+        if (count < top_k) count++;
+    }
+    return count;
+}
+
+/* SwiGLU over one expert pair. `act`/`scratch` hold ff-sized intermediates;
+ * the result is written with the projection's own output width. */
+static void kolibri1_swiglu(
+        const ds4_model  *m,
+        const ds4_tensor *gate,
+        const ds4_tensor *up,
+        const ds4_tensor *down,
+        const float      *x,
+        float            *act,
+        float            *scratch,
+        float            *out) {
+    const uint32_t ff = DS4_N_FF_EXP;
+    matvec_any(act, m, gate, x);
+    for (uint32_t i = 0; i < ff; i++) act[i] = silu(act[i]);
+    matvec_any(scratch, m, up, x);
+    for (uint32_t i = 0; i < ff; i++) act[i] *= scratch[i];
+    matvec_any(out, m, down, act);
+}
+
+static void kolibri1_forward_token_cpu(
+        float                  *logits,
+        const ds4_model        *m,
+        const ds4_weights      *w,
+        ds4_kolibri1_kv        *cache,
+        int                    token,
+        uint32_t               pos,
+        ds4_kolibri1_cpu_scratch *s) {
+    const uint32_t embd = DS4_N_EMBD;
+    const uint32_t head = DS4_N_HEAD, kv_head = DS4_N_HEAD_KV, head_dim = DS4_N_HEAD_DIM;
+    const uint32_t ff = DS4_N_FF_EXP;
+    const uint32_t kv_dim = kv_head * head_dim;
+    const uint32_t group = head / kv_head;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint32_t n_layers = DS4_N_LAYER;
+
+    if (pos >= cache->ctx) ds4_die("Kolibri-1 position is outside the allocated context");
+    ref_row(m, w->token_embd, (uint64_t)token, s->residual);
+
+    for (uint32_t il = 0; il < n_layers; il++) {
+        const ds4_layer_weights *layer = &w->layer[il];
+        const bool full = ds4_kolibri1_layer_is_full(il);
+        ds4_kolibri1_kv_layer *kv = &cache->layer[il];
+
+        rms_norm_weight(s->x, s->residual, ref_f32(m, layer->attn_norm), embd, DS4_RMS_EPS);
+        matvec_any(s->q, m, layer->attn_q, s->x);
+        matvec_any(s->k, m, layer->attn_k, s->x);
+        matvec_any(s->v, m, layer->attn_v, s->x);
+        const float *qk_norm = ref_f32(m, layer->attn_q_norm);
+        const float *kk_norm = ref_f32(m, layer->attn_k_norm);
+        for (uint32_t h = 0; h < head; h++)
+            rms_norm_weight(s->q + (uint64_t)h * head_dim, s->q + (uint64_t)h * head_dim,
+                            qk_norm, head_dim, DS4_RMS_EPS);
+        for (uint32_t h = 0; h < kv_head; h++)
+            rms_norm_weight(s->k + (uint64_t)h * head_dim, s->k + (uint64_t)h * head_dim,
+                            kk_norm, head_dim, DS4_RMS_EPS);
+        if (!full) {
+            kolibri1_rope(s->q, head, head_dim, pos);
+            kolibri1_rope(s->k, kv_head, head_dim, pos);
+        }
+
+        /* Sliding layers hold exactly one window of rows, compacted so that
+         * rows 0..count-1 are positions pos+1-count..pos: shift left once the
+         * window is full, then append; full layers just append at pos. */
+        const uint32_t count = full ? pos + 1u :
+            (pos + 1u < DS4_N_SWA ? pos + 1u : DS4_N_SWA);
+        if (!full && pos >= kv->rows) {
+            memmove(kv->k, kv->k + (size_t)kv_dim,
+                    (size_t)(count - 1u) * kv_dim * sizeof(float));
+            memmove(kv->v, kv->v + (size_t)kv_dim,
+                    (size_t)(count - 1u) * kv_dim * sizeof(float));
+        }
+        const uint32_t write_row = full ? pos : count - 1u;
+        memcpy(kv->k + (size_t)write_row * kv_dim, s->k, (size_t)kv_dim * sizeof(float));
+        memcpy(kv->v + (size_t)write_row * kv_dim, s->v, (size_t)kv_dim * sizeof(float));
+        for (uint32_t h = 0; h < head; h++) {
+            const float *qh = s->q + (uint64_t)h * head_dim;
+            const uint32_t g = (h / group) * head_dim;
+            float max_score = -3.402823466e+38f;
+            for (uint32_t i = 0; i < count; i++) {
+                const float *kr = kv->k + (size_t)i * kv_dim + g;
+                double acc = 0.0;
+                for (uint32_t d = 0; d < head_dim; d++) acc += (double)kr[d] * qh[d];
+                const float score = (float)acc * scale;
+                s->scores[i] = score;
+                if (score > max_score) max_score = score;
+            }
+            double sum = 0.0;
+            for (uint32_t i = 0; i < count; i++) {
+                s->scores[i] = expf(s->scores[i] - max_score);
+                sum += s->scores[i];
+            }
+            float *dst = s->context + (uint64_t)h * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) dst[d] = 0.0f;
+            for (uint32_t i = 0; i < count; i++) {
+                const float *vr = kv->v + (size_t)i * kv_dim + g;
+                const float wgt = s->scores[i];
+                for (uint32_t d = 0; d < head_dim; d++) dst[d] += wgt * vr[d];
+            }
+            const float inv = (float)(1.0 / sum);
+            for (uint32_t d = 0; d < head_dim; d++) dst[d] *= inv;
+        }
+        matvec_any(s->attn, m, layer->attn_output, s->context);
+        rms_norm_weight(s->attn, s->attn, ref_f32(m, layer->post_attn_norm), embd, DS4_RMS_EPS);
+        for (uint32_t i = 0; i < embd; i++) s->residual[i] += s->attn[i];
+
+        rms_norm_weight(s->x, s->residual, ref_f32(m, layer->ffn_norm), embd, DS4_RMS_EPS);
+
+        const float *router_w = ref_f32(m, layer->ffn_gate_inp);
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < embd; i++) acc += (double)router_w[(uint64_t)e * embd + i] * s->x[i];
+            s->router[e] = (float)acc;
+        }
+        const float *bias = ref_f32(m, layer->ffn_exp_probs_b);
+        const uint32_t top_k = kolibri1_route(s->router, bias, DS4_N_EXPERT, DS4_N_EXPERT_USED, s->selected);
+        /* s->attn accumulates the routed experts while s->context holds the
+         * shared one; s->moe is the sum that enters the residual stream. */
+        for (uint32_t i = 0; i < embd; i++) s->attn[i] = 0.0f;
+        for (uint32_t i = 0; i < top_k; i++) {
+            const uint32_t e = s->selected[i];
+            const float weight = sigmoid_stable(s->router[e]);
+            kolibri1_expert_matvec(m, layer->ffn_gate_exps, e, ff, s->x, s->ff_a);
+            for (uint32_t j = 0; j < ff; j++) s->ff_a[j] = silu(s->ff_a[j]);
+            kolibri1_expert_matvec(m, layer->ffn_up_exps, e, ff, s->x, s->ff_b);
+            for (uint32_t j = 0; j < ff; j++) s->ff_a[j] *= s->ff_b[j];
+            kolibri1_expert_matvec(m, layer->ffn_down_exps, e, embd, s->ff_a, s->context);
+            for (uint32_t j = 0; j < embd; j++) s->attn[j] += weight * s->context[j];
+        }
+        kolibri1_swiglu(m, layer->ffn_gate_shexp, layer->ffn_up_shexp, layer->ffn_down_shexp,
+                        s->x, s->ff_a, s->ff_b, s->moe);
+        for (uint32_t i = 0; i < embd; i++) s->moe[i] += s->attn[i];
+        rms_norm_weight(s->moe, s->moe, ref_f32(m, layer->post_ffn_norm), embd, DS4_RMS_EPS);
+        for (uint32_t i = 0; i < embd; i++) s->residual[i] += s->moe[i];
+    }
+
+    rms_norm_weight(s->x, s->residual, ref_f32(m, w->output_norm), embd, DS4_RMS_EPS);
+    matvec_any(logits, m, w->output, s->x);
+    cache->filled = pos + 1u;
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
@@ -70870,14 +71204,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (ds4_model_is_kolibri1() && !opt->inspect_only) {
-        /* The family, tokenizer and layout are wired, but no CPU reference or
-         * Metal graph exists yet. Refuse loudly instead of running the V4
-         * path against these tensors. */
-        fprintf(stderr, "ds4: Kolibri-1 inference is not implemented yet; "
-                        "this build loads and inspects Kolibri GGUFs only\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        /* The Metal graph does not exist yet, so the CPU reference is the only
+         * backend that can run these weights. Other combinations are refused
+         * here rather than falling through to the DeepSeek path. */
+        if (e->backend != DS4_BACKEND_CPU || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
+            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            opt->first_token_test ||
+            (opt->mtp_path && opt->mtp_path[0]) || opt->vision_path) {
+            fprintf(stderr, "ds4: Kolibri-1 currently runs on the CPU reference only; "
+                            "Metal, CUDA, tensor parallelism, pipeline execution, SSD streaming, "
+                            "DSpark, MTP models and vision are not supported\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
@@ -73116,6 +73457,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                      e->prefill_chunk);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        if (ds4_model_is_kolibri1() &&
+            (!kolibri1_kv_init(&s->kolibri1_cpu, (uint32_t)ctx_size) ||
+             !kolibri1_cpu_scratch_init(&s->kolibri1_cpu_scratch))) {
+            fprintf(stderr, "ds4: cannot allocate the Kolibri-1 CPU KV cache\n");
+            ds4_session_free(s);
+            return 1;
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -73584,6 +73932,8 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+        kolibri1_kv_free(&s->kolibri1_cpu);
+        kolibri1_cpu_scratch_free(&s->kolibri1_cpu_scratch);
     }
 #ifndef DS4_NO_GPU
     else {
@@ -75545,6 +75895,33 @@ int ds4_session_sync_multimodal(
     return rc;
 }
 
+static int session_cpu_prefill_tokens(
+        ds4_session     *s,
+        const ds4_tokens *prompt,
+        char            *err,
+        size_t           errlen) {
+    /* Kolibri-1 has no layer-major CPU prefill: one token at a time keeps the
+     * reference straightforward, and the CPU backend is a debug path. */
+    if (!ds4_model_is_kolibri1()) return 1;
+    ds4_engine *e = s->engine;
+    session_cpu_reset_cache(s);
+    for (int i = 0; i < prompt->len; i++) {
+        if (ds4_session_cancelled(s)) {
+            snprintf(err, errlen, "interrupted");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        kolibri1_forward_token_cpu(s->logits, &e->model, &e->weights,
+                                   &s->kolibri1_cpu, prompt->v[i], (uint32_t)i,
+                                   &s->kolibri1_cpu_scratch);
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+    }
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_note_checkpoint(s);
+    return 0;
+}
+
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -75673,6 +76050,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
 
         session_cpu_reset_cache(s);
+        if (ds4_model_is_kolibri1()) {
+            const int rc = session_cpu_prefill_tokens(s, prompt, err, errlen);
+            if (rc != 0) return rc;
+            return 0;
+        }
         prefill_layer_major_cpu(s->logits,
                                 &e->model,
                                 &e->weights,
@@ -77597,16 +77979,23 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
+        if (ds4_model_is_kolibri1()) {
+            kolibri1_forward_token_cpu(s->logits, &e->model, &e->weights,
+                                       &s->kolibri1_cpu, token,
+                                       (uint32_t)s->checkpoint.len,
+                                       &s->kolibri1_cpu_scratch);
+        } else {
+            forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &s->cpu_cache,
+                                                     token,
+                                                     (uint32_t)s->checkpoint.len,
+                                                     e->directional_steering_dirs,
+                                                     e->directional_steering_attn_scale,
+                                                     e->directional_steering_ffn_scale,
+                                                     &s->cpu_scratch);
+        }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -78635,7 +79024,7 @@ static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
     for (int i = 0; i < count; i++) {
         ds4_qwen4_gpu_graph *rg = &items[i].session->qwen4_graph;
         float *dst = row + (uint64_t)i * hc_dim;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
+        ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
         for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         uint32_t pos3[4];
         qwen4_mrope_pos(NULL, 0, rg->pos, &rg->mrope_delta, pos3);
@@ -79032,7 +79421,7 @@ static bool qwen4_batch_stage_embeddings_ragged(const qwen4_batch_member *mem, i
         for (uint32_t t = 0; t < mem[i].n; t++) {
             const uint32_t r = mem[i].row0 + t;
             float *dst = row + (uint64_t)r * hc_dim;
-            qwen4_ref_row(m, w->token_embd, (uint64_t)mem[i].tokens[t], dst);
+            ref_row(m, w->token_embd, (uint64_t)mem[i].tokens[t], dst);
             for (uint32_t sidx = 1; sidx < hc; sidx++) memcpy(dst + (uint64_t)sidx * E, dst, E * sizeof(float));
             uint32_t pos3[4];
             qwen4_mrope_pos(NULL, 0, rg->pos + t, &rg->mrope_delta, pos3);
@@ -79197,7 +79586,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         }
     }
     for (uint32_t t = 0; t < N; t++)
-        qwen4_ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
+        ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
     if (!ds4_gpu_tensor_write(g->batch_head_x, 0, g->host_row, (uint64_t)N * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
     /* The trunk's MoE scratch is idle here. Reuse it for predictor inputs

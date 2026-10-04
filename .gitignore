@@ -75,6 +75,7 @@
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
 /tests/test_engram
+/tests/test_prompt_prefix
 *.o
 *.dSYM/
 __pycache__/

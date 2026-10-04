@@ -742,6 +742,7 @@ test-kolibri1-gguf: ds4
 	python3 tests/make_kolibri1_mini.py --tokenizer "$(KOLIBRI1_TOKENIZER_DIR)" \
 		--out "$(KOLIBRI1_MINI_GGUF)"
 	./ds4 -m "$(KOLIBRI1_MINI_GGUF)" --inspect
+	python3 tests/test_kolibri1_parity.py --gguf "$(KOLIBRI1_MINI_GGUF)"
 
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
