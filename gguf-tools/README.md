@@ -354,3 +354,49 @@ pre-tokenizer from a current `regex` release.
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation
 (`tests/qwen4_vision_ref.py`).
+
+## Convert Kolibri-1 (converter only; runtime support pending)
+
+`kolibri1_quantize.py` converts Aleph Alpha's Kolibri-1 to the DS4 GGUF schema.
+It accepts both releases, which share tensor names: the FP8 snapshot
+(F8_E4M3 weights in 128x128 blocks with F32 scales) and `Kolibri-1-BF16`.
+Norms, routers and the expert bias stay F32; the routed experts carry 96.7% of
+the parameters, so `--quant` selects only their format:
+
+| Recipe | Routed experts | File size |
+| --- | --- | ---: |
+| `f16` | F16 | 156.3 GB |
+| `q8` | Q8_0 | 83.1 GB |
+| `q4` | Q4_K | 45.7 GB |
+| `q2` | IQ2_XXS gate/up, Q2_K down | 24.5 GB |
+
+```sh
+make -C gguf-tools libds4quants.dylib
+python3 gguf-tools/kolibri1_quantize.py \
+  --hf models/Kolibri-1-BF16 \
+  --source-revision <40-hex HF commit> \
+  --out gguf/Kolibri-1-Q4.gguf --quant q4 --dry-run
+```
+
+Remove `--dry-run` to write the file (resume with `--resume`). The plan is
+rebuilt from the source headers and every released tensor must be claimed
+exactly once, so an upstream snapshot change fails before any payload is
+written. `--imatrix` accepts the usual legacy `.dat`; IQ2_XXS falls back to
+the weight-energy bootstrap when absent.
+
+Audit a finished artifact, including sampled payload re-encoding, with:
+
+```sh
+python3 gguf-tools/kolibri1_validate_gguf.py \
+  --hf models/Kolibri-1-BF16 --gguf gguf/Kolibri-1-Q4.gguf \
+  --source-revision <40-hex HF commit> --quant q4 --payload
+```
+
+`python3 tests/test_kolibri1_conversion.py` covers the index validation,
+conversion plan, tokenizer records, FP8 dequantization and the writer/resume
+logic without downloading the checkpoint.
+
+**Runtime support is not implemented yet.** These tools produce and verify the
+artifact only; `ds4` cannot load it until the Kolibri family, tokenizer and
+Metal graph land. The design and staged plan live in the gitignored
+`misc/KOLIBRI1_PLAN.md`.
