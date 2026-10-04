@@ -355,7 +355,7 @@ pre-tokenizer from a current `regex` release.
 `make test-qwen4-vision` checks the vision tower against the HF implementation
 (`tests/qwen4_vision_ref.py`).
 
-## Convert Kolibri-1 (converter only; runtime support pending)
+## Convert Kolibri-1 (CPU reference runtime landed; Metal graph pending)
 
 `kolibri1_quantize.py` converts Aleph Alpha's Kolibri-1 to the DS4 GGUF schema.
 It accepts both releases, which share tensor names: the FP8 snapshot
@@ -396,7 +396,9 @@ python3 gguf-tools/kolibri1_validate_gguf.py \
 conversion plan, tokenizer records, FP8 dequantization and the writer/resume
 logic without downloading the checkpoint.
 
-**Runtime support is not implemented yet.** These tools produce and verify the
-artifact only; `ds4` cannot load it until the Kolibri family, tokenizer and
-Metal graph land. The design and staged plan live in the gitignored
-`misc/KOLIBRI1_PLAN.md`.
+**Runtime is partial.** `ds4` loads, inspects and runs these artifacts on the
+CPU reference backend (`ds4 --cpu -m gguf/Kolibri-1-Q8.gguf`); the correctness
+reference is `tests/kolibri1_reference.py` plus the parity gate in
+`make test-kolibri1-gguf`. The Metal graph does not exist yet, so every other
+backend combination is refused. The design and staged plan live in the
+gitignored `misc/KOLIBRI1_PLAN.md`.
