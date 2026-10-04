@@ -68450,16 +68450,28 @@ static void kolibri1_expert_matvec(
         uint32_t          out_dim,
         const float      *x,
         float            *out) {
+    if ((uint64_t)expert >= t->dim[2]) ds4_die("expert id is outside expert tensor");
+    if ((uint64_t)out_dim != t->dim[1]) ds4_die("expert matvec row count does not match the plane");
     const uint64_t in_dim = t->dim[0];
-    const uint64_t plane = (uint64_t)out_dim * in_dim;
-    const float *base = (const float *)tensor_data(m, t) +
-                        (uint64_t)expert * plane;
-    for (uint32_t r = 0; r < out_dim; r++) {
-        const float *row = base + (uint64_t)r * in_dim;
-        double acc = 0.0;
-        for (uint64_t i = 0; i < in_dim; i++) acc += (double)row[i] * x[i];
-        out[r] = (float)acc;
+    if (t->type == 0) {
+        const float *base = (const float *)tensor_data(m, t) +
+                            (uint64_t)expert * (out_dim * in_dim);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            const float *row = base + (uint64_t)r * in_dim;
+            double acc = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++) acc += (double)row[i] * x[i];
+            out[r] = (float)acc;
+        }
+        return;
     }
+    if (t->type == 8) {
+        /* Block bytes must not be dereferenced as floats: each Q8_0 row is
+         * fp16 scale × int8 quants, and the activation is prequantized the
+         * same way as the dense path. */
+        matvec_q8_0_3d_slice(out, m, t, x, expert);
+        return;
+    }
+    ds4_die("unsupported expert tensor type");
 }
 
 /* Top-k on router + bias, insertion ordered so equal scores keep the lower

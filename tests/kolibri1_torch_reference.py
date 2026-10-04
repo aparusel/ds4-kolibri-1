@@ -82,6 +82,7 @@ class Tensors:
         self.data_start = data_start
         self.dtype = dtype
         self.cache = {}
+        self.type_of = {}
         self.materialize = False
 
     def raw(self, name):
@@ -103,17 +104,14 @@ class Tensors:
         else:
             raise ValueError(f"unsupported tensor type {info['type']} for {name}")
         math_view = values.reshape(tuple(reversed(info["dims"])))
-        if math_view.size * array_itemsize(info["type"]) <= (1 << 20):
+        self.type_of[name] = info["type"]
+        if math_view.size * math_view.dtype.itemsize <= (1 << 20):
             self.cache[name] = math_view
         return math_view
 
     def get(self, name):
         stored = self.cache.get(name)
         return stored if stored is not None else self.raw(name)
-
-
-def array_itemsize(gguf_type):
-    return {0: 4, 1: 2}[gguf_type]
 
 
 def torchify(array, device):
@@ -236,28 +234,79 @@ def sigmoid_logit_add_routing(logits, bias, topk):
     return weights, ids
 
 
-def routed_swiglu(x, ids, r_gate, r_up, r_down, weights):
-    """Per slot: slot weight * expert_plane(x), summed over the topk slots."""
+def q8_block_quant(x):
+    """ds4's quantize_q8_0_activation, vectorized: per 32-element block of the
+    last dim, scale = amax/127, codes = round-even(x/scale) clamped to
+    [-128, 127]. Matches lrintf's default rounding (half-to-even)."""
+    grouped = x.reshape(*x.shape[:-1], -1, 32)
+    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    scale = amax / 127.0
+    # ds4 computes id = 1/d (a second fp32 rounding), then lrintf(x * id)
+    f32 = x.dtype
+    inv = (1.0 / scale) if scale.dtype == torch.float32 else torch.reciprocal(scale.to(torch.float64)).to(scale.dtype)
+    scale_safe = inv
+    # zero blocks keep zero codes (ds4: id = 0 -> codes 0)
+    scale_safe = torch.where(scale > 0.0, scale_safe, torch.zeros_like(scale_safe))
+    codes = torch.round(grouped * scale_safe).clamp(-128, 127)
+    return codes, scale
+
+
+def q8_render(x):
+    """The rendered activation ds4's Q8 matmuls actually multiply against:
+    codes and scales folded back into a per-block-grid rounded copy of x."""
+    codes, scale = q8_block_quant(x)          # scale is [.., blocks, 1]
+    return (codes * scale).reshape(x.shape)
+
+
+def dense_any(x, weight, is_q8):
+    """y = x @ W.T with ds4 arithmetic.
+
+    F32/F16 weights: plain fp32 matmul. Q8_0 weights: ds4 dequants each row
+    block into (fp16 scale x int8) and multiplies against the int8-quantized
+    activation, i.e. W_deq @ render(quant(x)) up to fp summation order, so
+    the reference reproduces the block-quantization noise instead of an
+    idealized pure-fp32 matmul. Applies wherever the C path quantizes
+    activations: attention/o projections, expert stacks, shared experts, and
+    the output head.
+    """
+    if not is_q8:
+        return x @ weight.T
+    return q8_render(x) @ weight.T
+
+
+
+
+def routed_any(x, ids, r_gate, r_up, r_down, weights, is_q8):
+    """Per slot: slot weight * expert_plane(x), summed over the topk slots.
+
+    Q8 mode quantizes x once for gate and up (ds4 re-quantizes the same
+    buffer; deterministic), then re-quantizes the silu(gate)*up product for
+    the down projection, per token's own expert.
+    """
+    xhat = q8_render(x) if is_q8 else x
     routed = torch.zeros_like(x)
     for slot in range(ids.shape[1]):
         expert_ids = ids[:, slot]                              # [T]
         planes_g = r_gate[expert_ids]                          # [T, inter, in]
         planes_u = r_up[expert_ids]                            # [T, inter, in]
         hidden = torch.nn.functional.silu(
-            torch.einsum("td,tfd->tf", x, planes_g)) * \
-            torch.einsum("td,tfd->tf", x, planes_u)            # [T, inter]
-        contribution = torch.einsum("tf,tof->to", hidden,
-                                    r_down[expert_ids])     # [T, out]
+            torch.einsum("td,tfd->tf", xhat, planes_g)) * \
+            torch.einsum("td,tfd->tf", xhat, planes_u)         # [T, inter]
+        combined = q8_render(hidden) if is_q8 else hidden
+        contribution = torch.einsum("tf,tof->to", combined,
+                                    r_down[expert_ids])        # [T, out]
         routed = routed + contribution * weights[:, slot:slot + 1]
     return routed
 
 
-def moe_block(w, x, topk):
+def moe_block(w, x, topk, is_q8):
     router = x @ w["gate_inp"].T                        # [T, n_expert] fp32
     weights, ids = sigmoid_logit_add_routing(router, w["bias"], topk)
-    routed = routed_swiglu(x, ids, w["r_gate"], w["r_up"], w["r_down"], weights)
-    shared = torch.nn.functional.silu(x @ w["s_gate"].T) * (x @ w["s_up"].T)
-    shared = shared @ w["s_down"].T
+    routed = routed_any(x, ids, w["r_gate"], w["r_up"], w["r_down"],
+                        weights, is_q8)
+    shared = torch.nn.functional.silu(dense_any(x, w["s_gate"], is_q8)) * \
+        dense_any(x, w["s_up"], is_q8)
+    shared = dense_any(shared, w["s_down"], is_q8)
     return shared + routed
 
 
@@ -281,6 +330,7 @@ def forward(ts: Tensors, tokens, device=None):
     residual = None
 
     for il, layer_type in enumerate(layer_types):
+        weights_q8 = ts.type_of.get(f"blk.{il}.attn_q.weight") == 8
         w = Layer(ts, il, layer_type == 1).load(device)
         is_full = layer_type == 1
 
@@ -290,9 +340,9 @@ def forward(ts: Tensors, tokens, device=None):
         else:
             x, residual = fused_rms_norm(x, residual, w["attn_norm"], eps)
 
-        q = x @ w["q"].T
-        k = x @ w["k"].T
-        v = x @ w["v"].T
+        q = dense_any(x, w["q"], weights_q8)
+        k = dense_any(x, w["k"], weights_q8)
+        v = dense_any(x, w["v"], weights_q8)
         q = per_head_rms_norm(q, w["q_norm"], n_head, head_dim, eps)
         k = per_head_rms_norm(k, w["k_norm"], n_kv, head_dim, eps)
         if not is_full:
@@ -301,16 +351,17 @@ def forward(ts: Tensors, tokens, device=None):
             k = rotate_half_rope(k.view(seq, n_kv, head_dim),
                                  positions, rope_base, head_dim).reshape(k.shape)
         attn = attention(q, k, v, n_head, n_kv, head_dim, window, is_full)
-        attention_out = attn @ w["o"].T
+        attention_out = dense_any(attn, w["o"], weights_q8)
         attention_out = rms_norm(attention_out, w["post_attn_norm"], eps)
         x, residual = fused_rms_norm(attention_out, residual, w["ffn_norm"], eps)
-        moe_out = moe_block(w, x, topk)
+        moe_out = moe_block(w, x, topk, weights_q8)
         x = rms_norm(moe_out, w["post_ffn_norm"], eps)
         del w  # free this layer's big tensors before the next one materializes
 
     out_norm = torchify(ts.get("output_norm.weight"), device)
     logits = rms_norm(residual + x, out_norm, eps)       # final fused norm join
-    values = logits @ torchify(ts.get("output.weight"), device).T
+    values = dense_any(logits, ts.get("output.weight"),
+                       ts.type_of.get("output.weight") == 8)
     return values[seq - 1]                               # next-token logits
 
 
