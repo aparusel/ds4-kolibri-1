@@ -69148,6 +69148,34 @@ static void kolibri1_expert_matvec(
         matvec_q8_0_3d_slice(out, m, t, x, expert);
         return;
     }
+    if (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K ||
+        t->type == DS4_TENSOR_IQ2_XXS) {
+        /* Same recipe as the dense Q4_K/Q2_K/IQ2_XXS matvecs: quantize the
+         * activation to Q8_K once, then dot every expert row against it. */
+        if (in_dim % QK_K != 0) {
+            ds4_die("quantized expert matvec needs a 256-aligned input width");
+        }
+        uint64_t plane_in = 0, plane_out = 0, row_bytes = 0;
+        const uint8_t *base = tensor_expert_bytes(m, t, expert, &plane_in, &plane_out, &row_bytes);
+        (void)plane_in;
+        (void)plane_out;
+        block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+        ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            const uint8_t *row = base + (uint64_t)r * row_bytes;
+            float sum = 0.0f;
+            if (t->type == DS4_TENSOR_Q4_K) {
+                ds4_vec_dot_q4_K_q8_K((int)in_dim, &sum, (const block_q4_K *)row, xq);
+            } else if (t->type == DS4_TENSOR_Q2_K) {
+                ds4_vec_dot_q2_K_q8_K((int)in_dim, &sum, (const block_q2_K *)row, xq);
+            } else {
+                ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &sum, (const block_iq2_xxs *)row, xq);
+            }
+            out[r] = sum;
+        }
+        free(xq);
+        return;
+    }
     ds4_die("unsupported expert tensor type");
 }
 
