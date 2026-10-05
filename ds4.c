@@ -56,6 +56,9 @@
 #define DS4_HAS_QWEN4_METAL 1
 #endif
 #endif
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#define DS4_HAS_KOLIBRI1_METAL 1
+#endif
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
 #endif
@@ -39912,6 +39915,15 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+#ifdef DS4_HAS_KOLIBRI1_METAL
+static uint32_t kolibri1_prefill_chunk_tokens(uint32_t ctx) {
+    const char *env = getenv("DS4_KOLIBRI1_PREFILL_CHUNK");
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
+    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+    return chunk > ctx ? ctx : chunk;
+}
+#endif
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -39919,6 +39931,23 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_kolibri1()) {
+        /* Every layer keeps absolute-position f32 K/V rows for the whole
+         * context; transients scale with the prefill chunk. */
+        const uint64_t T = prefill_chunk ? prefill_chunk : kolibri1_prefill_chunk_tokens(ctx);
+        const uint64_t E = DS4_N_EMBD;
+        const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+        m.prefill_cap = (uint32_t)T;
+        m.raw_cap = ctx;
+        m.comp_cap = 2u;
+        m.raw_bytes = (uint64_t)DS4_N_LAYER * ctx * kv_row * 2u;
+        m.scratch_bytes = T * (4u * E + (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM + 2u * (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM +
+                               DS4_N_EXPERT + 2u * ((uint64_t)DS4_N_EXPERT_USED + 1u) * (DS4_N_FF_EXP + E)) * 4u;
+        m.total_bytes = m.raw_bytes + m.scratch_bytes;
+        return m;
+    }
+#endif
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
         /* per-token f16 K/V and raw indexer keys per attention layer, pooled
          * block keys, rope positions; transients scale with the prefill chunk */
@@ -59610,6 +59639,305 @@ static int generate_qwen4_metal_argmax(
 
 #endif
 
+#ifdef DS4_HAS_KOLIBRI1_METAL
+/* ------------------------------------------------------------------------
+ * Kolibri-1 GPU graph.  The same shape as the CPU reference forward
+ * (kolibri1_forward_token_cpu): a plain residual stream, sandwich norms,
+ * GQA attention with per-head QK RMSNorm, RoPE on sliding layers only,
+ * and every layer a top-6 sigmoid-router MoE plus an unweighted shared
+ * expert.  One command batch per forward; f32 transients sized for
+ * cap_tokens rows so the same kernels serve decode (T=1) and chunked
+ * prefill.  K/V rows are absolute positions for every layer; the span a
+ * row attends (last min(pos+1, window) rows on sliding layers, 0..pos on
+ * full ones) is decided in the kernels, mirroring the CPU cache spans.
+ * --------------------------------------------------------------------- */
+
+typedef struct ds4_kolibri1_gpu_graph {
+    uint32_t ctx_cap;
+    uint32_t pos;
+    uint32_t cap_tokens;
+    bool owns_scratch;   /* false when the scratch is borrowed from the engine arena */
+    ds4_gpu_tensor *R, *x, *blk, *attn_o, *moe_out, *logits;
+    ds4_gpu_tensor *q, *kv;       /* [T][H*D] and [T][2*Hkv*D] projections */
+    ds4_gpu_tensor *attn_part;    /* split partials, decode-sized */
+    ds4_gpu_tensor *router, *selected, *rweights;
+    ds4_gpu_tensor *mid, *part;
+    ds4_gpu_tensor *layer_k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
+    float *host_row;
+} ds4_kolibri1_gpu_graph;
+
+/* Projections the graph accepts: the fixture is all F32, the released
+ * recipes carry Q8_0 attention/experts and an F16 or Q8_0 embedding. */
+static bool kolibri1_graph_dense_ok(const ds4_tensor *t) {
+    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 ||
+                 t->type == DS4_TENSOR_F32 || t->type == DS4_TENSOR_BF16);
+}
+
+static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
+    if (!kolibri1_graph_dense_ok(w->token_embd) || !kolibri1_graph_dense_ok(w->output)) {
+        fprintf(stderr, "ds4: Kolibri-1 GPU graph needs Q8_0/F16/BF16/F32 embedding and output weights\n");
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const ds4_tensor *dense[] = {
+            l->attn_q, l->attn_k, l->attn_v, l->attn_output,
+            l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp,
+        };
+        for (size_t i = 0; i < sizeof(dense) / sizeof(dense[0]); i++) {
+            if (!kolibri1_graph_dense_ok(dense[i])) {
+                fprintf(stderr, "ds4: Kolibri-1 GPU graph: unsupported dense weight type %u in layer %u\n",
+                        dense[i] ? dense[i]->type : 0u, il);
+                return false;
+            }
+        }
+        if (!kolibri1_graph_dense_ok(l->ffn_gate_exps) ||
+            l->ffn_up_exps->type != l->ffn_gate_exps->type ||
+            !kolibri1_graph_dense_ok(l->ffn_down_exps)) {
+            fprintf(stderr, "ds4: Kolibri-1 GPU graph: unsupported routed-expert weight types in layer %u\n", il);
+            return false;
+        }
+        /* The expert row-dot walks 32-wide blocks, and the norms and rope
+         * staging want a float4-multiple head dimension. */
+        if (l->attn_q->dim[0] % 32u != 0 || l->attn_output->dim[0] % 32u != 0) {
+            fprintf(stderr, "ds4: Kolibri-1 GPU graph needs projection widths divisible by 32\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor *owned[] = {
+        g->R, g->x, g->blk, g->attn_o, g->moe_out, g->logits, g->q, g->kv,
+        g->attn_part, g->router, g->selected, g->rweights, g->mid, g->part,
+    };
+    if (g->owns_scratch) {
+        for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
+            ds4_gpu_tensor_free(owned[i]);
+        }
+    }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_k_cache[il]);
+        ds4_gpu_tensor_free(g->layer_v_cache[il]);
+        g->layer_k_cache[il] = NULL;
+        g->layer_v_cache[il] = NULL;
+    }
+    if (g->owns_scratch) free(g->host_row);
+    g->host_row = NULL;
+    memset(g, 0, sizeof(*g));
+}
+
+static ds4_gpu_tensor *kolibri1_graph_alloc_f32(uint64_t n) {
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(n * sizeof(float));
+    if (t) ds4_gpu_tensor_fill_f32(t, 0.0f, n);
+    return t;
+}
+
+static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w,
+                                 uint32_t ctx_cap, uint32_t cap_tokens,
+                                 const ds4_kolibri1_gpu_graph *shared) {
+    memset(g, 0, sizeof(*g));
+    if (!kolibri1_graph_weights_supported(w)) return false;
+    const uint64_t E = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    g->ctx_cap = ctx_cap;
+    g->cap_tokens = cap_tokens;
+
+    bool ok = true;
+    g->owns_scratch = shared == NULL;
+#define KOLIBRI1_ALLOC(field_, n_) do { g->field_ = kolibri1_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
+    if (shared) {
+#define KOLIBRI1_BORROW(field_) g->field_ = shared->field_;
+        KOLIBRI1_BORROW(R) KOLIBRI1_BORROW(x) KOLIBRI1_BORROW(blk) KOLIBRI1_BORROW(attn_o)
+        KOLIBRI1_BORROW(moe_out) KOLIBRI1_BORROW(q) KOLIBRI1_BORROW(kv) KOLIBRI1_BORROW(attn_part)
+        KOLIBRI1_BORROW(router) KOLIBRI1_BORROW(selected) KOLIBRI1_BORROW(rweights)
+        KOLIBRI1_BORROW(mid) KOLIBRI1_BORROW(part)
+#undef KOLIBRI1_BORROW
+        g->host_row = shared->host_row;
+        goto private_state;
+    }
+    KOLIBRI1_ALLOC(R, cap_tokens * E);
+    KOLIBRI1_ALLOC(x, cap_tokens * E);
+    KOLIBRI1_ALLOC(blk, cap_tokens * E);
+    KOLIBRI1_ALLOC(attn_o, cap_tokens * q_dim);
+    KOLIBRI1_ALLOC(moe_out, cap_tokens * E);
+    KOLIBRI1_ALLOC(q, cap_tokens * q_dim);
+    KOLIBRI1_ALLOC(kv, cap_tokens * 2u * kv_dim);
+    KOLIBRI1_ALLOC(attn_part, ds4_gpu_kolibri_attn_part_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    KOLIBRI1_ALLOC(router, cap_tokens * DS4_N_EXPERT);
+    KOLIBRI1_ALLOC(selected, cap_tokens * DS4_N_EXPERT_USED);
+    KOLIBRI1_ALLOC(rweights, cap_tokens * DS4_N_EXPERT_USED);
+    KOLIBRI1_ALLOC(mid, cap_tokens * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP);
+    KOLIBRI1_ALLOC(part, cap_tokens * (DS4_N_EXPERT_USED + 1u) * E);
+    g->host_row = xmalloc((size_t)cap_tokens * E * sizeof(float));
+    ok = ok && g->host_row;
+
+private_state:
+    /* The logits belong to the caller that reads them back. */
+    KOLIBRI1_ALLOC(logits, DS4_N_VOCAB);
+#undef KOLIBRI1_ALLOC
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        /* Sliding layers only ever attend the last `window` rows, but the
+         * rows are absolute positions, so every layer reserves the full
+         * context; a windowed ring cache is a later memory optimization. */
+        g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * sizeof(float));
+        g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * sizeof(float));
+        ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il];
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: Kolibri-1 graph allocation failed (ctx %u)\n", ctx_cap);
+        kolibri1_graph_free(g);
+        return false;
+    }
+    return true;
+}
+
+static void kolibri1_graph_reset(ds4_kolibri1_gpu_graph *g) {
+    if (!g) return;
+    g->pos = 0;
+}
+
+/* One dense projection of the same weight for n_tok rows. */
+static bool kolibri1_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                          const ds4_gpu_tensor *x, uint32_t n_tok) {
+    const uint64_t in_dim = w->dim[0], out_dim = w->ndim >= 2 ? w->dim[1] : 1u;
+    return metal_graph_matmul_plain_tensor(out, m, w, in_dim, out_dim, x, n_tok);
+}
+
+/* Attention sublayer: q/k/v projections, per-head QK norm + rope into the
+ * f32 caches, span attention, output projection.  The output lands in blk;
+ * the caller norms it against post_attn_norm and folds it into R. */
+static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
+                                     const ds4_layer_weights *l, uint32_t il,
+                                     uint32_t pos0, uint32_t T) {
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint32_t full = ds4_kolibri1_layer_is_full(il);
+    ds4_gpu_tensor *kproj = ds4_gpu_tensor_view(g->kv, 0, (uint64_t)T * kv_dim * sizeof(float));
+    ds4_gpu_tensor *vproj = ds4_gpu_tensor_view(g->kv, (uint64_t)T * kv_dim * sizeof(float),
+                                                (uint64_t)T * kv_dim * sizeof(float));
+    if (!kproj || !vproj) {
+        ds4_gpu_tensor_free(kproj);
+        ds4_gpu_tensor_free(vproj);
+        return false;
+    }
+    bool ok = kolibri1_gemv(g->q, m, l->attn_q, g->x, T) &&
+              kolibri1_gemv(kproj, m, l->attn_k, g->x, T) &&
+              kolibri1_gemv(vproj, m, l->attn_v, g->x, T) &&
+              ds4_gpu_kolibri_attn_prep_tensor(g->q, g->layer_k_cache[il], g->layer_v_cache[il],
+                                               g->q, kproj, vproj, m->map, m->size,
+                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                               T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                               pos0, g->ctx_cap, full ? 0u : 1u,
+                                               DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
+              ds4_gpu_kolibri_attn_decode_tensor(g->attn_o, g->q, g->layer_k_cache[il], g->layer_v_cache[il],
+                                                 T <= 2u ? g->attn_part : NULL, T,
+                                                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0,
+                                                 full ? 0u : DS4_N_SWA,
+                                                 1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
+              kolibri1_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+    ds4_gpu_tensor_free(kproj);
+    ds4_gpu_tensor_free(vproj);
+    return ok;
+}
+
+/* Every layer's MLP: sigmoid router with expert bias, per-(token, slot)
+ * expert matvecs, the shared expert as an extra slot, and the weighted sum
+ * (shared unweighted, matching the CPU reference exactly). */
+static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
+                               const ds4_layer_weights *l, uint32_t T) {
+    const uint32_t slots = DS4_N_EXPERT_USED;
+    bool ok = kolibri1_gemv(g->router, m, l->ffn_gate_inp, g->x, T) &&
+              ds4_gpu_kolibri_router_topk_tensor(g->selected, g->rweights, g->router,
+                                                 l->ffn_exp_probs_b->abs_offset, m->map, m->size,
+                                                 T, DS4_N_EXPERT, slots,
+                                                 DS4_EXPERT_WEIGHT_SCALE) &&
+              ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
+                                           l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                           l->ffn_gate_exps->type, DS4_N_EXPERT, T, slots,
+                                           DS4_N_EMBD, DS4_N_FF_EXP,
+                                           l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                           l->ffn_gate_shexp->type) &&
+              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
+                                            l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
+                                            DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
+                                            l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
+              ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
+    return ok;
+}
+
+/* Embeddings are staged on the host like the Qwen graph does: one ref_row
+ * per token from the mmap, then one write into R. */
+static bool kolibri1_graph_stage_inputs(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
+                                        const ds4_weights *w, const int *tokens, uint32_t T) {
+    for (uint32_t t = 0; t < T; t++) {
+        ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * DS4_N_EMBD);
+    }
+    return ds4_gpu_tensor_write(g->R, 0, g->host_row, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
+}
+
+/* Forward T tokens at pos0.  Norms run in-place through x as scratch: each
+ * sandwich norm normalizes its sublayer output, adds it to R, and the next
+ * pre-norm reads R again — the exact CPU reference order. */
+static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                          const int *tokens, uint32_t T, float *logits_out) {
+    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: Kolibri-1 token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+    }
+    const uint32_t pos0 = g->pos;
+    if (!kolibri1_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
+                                                         l->attn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS);
+        if (!kolibri1_graph_attention(g, m, l, il, pos0, T)) { ok = false; break; }
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->blk, m->map, m->size,
+                                                         l->post_attn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS) &&
+                     ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
+                                                         l->ffn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS);
+        if (ok) ok = kolibri1_graph_moe(g, m, l, T);
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->moe_out, m->map, m->size,
+                                                         l->post_ffn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS) &&
+                     ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
+    }
+    /* Final norm and head on the last row; callers read one logit row. */
+    if (ok) {
+        ds4_gpu_tensor *last_R = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * DS4_N_EMBD * sizeof(float),
+                                                     (uint64_t)DS4_N_EMBD * sizeof(float));
+        ok = last_R &&
+             ds4_gpu_rms_norm_weight_tensor(g->x, last_R, m->map, m->size,
+                                            w->output_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+        if (ok) ok = kolibri1_gemv(g->logits, m, w->output, g->x, 1);
+        ds4_gpu_tensor_free(last_R);
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok && logits_out) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok) g->pos += T;
+    return ok;
+}
+
+static bool kolibri1_graph_forward_token(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                         int token, float *logits_out) {
+    return kolibri1_graph_forward_tokens(g, m, w, &token, 1, logits_out);
+}
+#endif
+
 #ifndef DS4_NO_GPU
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
@@ -60559,6 +60887,10 @@ struct ds4_session {
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    ds4_kolibri1_gpu_graph kolibri_gpu;
+    bool kolibri_graph_ready;
 #endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -61580,6 +61912,16 @@ static bool ds4_session_is_glm(const ds4_session *s) {
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
+}
+
+static bool ds4_session_is_kolibri1(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_kolibri1();
+}
+
+/* Kolibri-1 sessions run the dedicated Metal graph; the CPU branch above
+ * already handled the CPU backend before this is consulted. */
+static bool ds4_session_kolibri_uses_gpu(const ds4_session *s) {
+    return ds4_session_is_kolibri1(s) && !ds4_session_is_cpu(s);
 }
 
 #ifndef DS4_NO_GPU
@@ -65386,7 +65728,8 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -71216,16 +71559,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (ds4_model_is_kolibri1() && !opt->inspect_only) {
-        /* The Metal graph does not exist yet, so the CPU reference is the only
-         * backend that can run these weights. Other combinations are refused
-         * here rather than falling through to the DeepSeek path. */
-        if (e->backend != DS4_BACKEND_CPU || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+        /* The Kolibri-1 Metal graph runs the plain decoder stack; CUDA,
+         * tensor parallelism and the other execution modes stay reserved
+         * until their graphs exist. */
+        const bool backend_ok =
+#ifdef DS4_HAS_KOLIBRI1_METAL
+            e->backend == DS4_BACKEND_METAL ||
+#endif
+            e->backend == DS4_BACKEND_CPU;
+        if (!backend_ok || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
             opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
             e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
             opt->first_token_test ||
             (opt->mtp_path && opt->mtp_path[0]) || opt->vision_path) {
-            fprintf(stderr, "ds4: Kolibri-1 currently runs on the CPU reference only; "
-                            "Metal, CUDA, tensor parallelism, pipeline execution, SSD streaming, "
+            fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference or single-host Metal; "
+                            "CUDA, tensor parallelism, pipeline execution, SSD streaming, "
                             "DSpark, MTP models and vision are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -73611,6 +73959,32 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 0;
     }
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_model_is_kolibri1()) {
+        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: Kolibri-1 sessions require single-host Metal\n");
+            free(s);
+            return 1;
+        }
+        const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
+            e->prefill_chunk : kolibri1_prefill_chunk_tokens((uint32_t)ctx_size);
+        if (!kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, NULL)) {
+            free(s);
+            return 1;
+        }
+        kolibri1_graph_reset(&s->kolibri_gpu);
+        s->kolibri_graph_ready = true;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+    }
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
         uint32_t layer_start = 0;
@@ -73968,6 +74342,11 @@ void ds4_session_free(ds4_session *s) {
             }
             if (s->qwen4_graph_ready && !s->qwen4_graph.owns_scratch && s->engine) s->engine->qwen4_arena_users--;
             qwen4_graph_free(&s->qwen4_graph);
+        } else
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (ds4_session_is_kolibri1(s)) {
+            kolibri1_graph_free(&s->kolibri_gpu);
         } else
 #endif
         if (ds4_session_is_glm(s)) {
@@ -76028,6 +76407,54 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return 0;
     }
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_session_kolibri_uses_gpu(s)) {
+        ds4_engine *e = s->engine;
+        int start = 0;
+        if (s->checkpoint_valid &&
+            s->kolibri_gpu.pos == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            kolibri1_graph_reset(&s->kolibri_gpu);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
+                return 1;
+            }
+        }
+        int prefill_rc = 0;
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                prefill_rc = DS4_SESSION_SYNC_INTERRUPTED;
+                break;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > s->kolibri_gpu.cap_tokens) chunk = s->kolibri_gpu.cap_tokens;
+            s->checkpoint_valid = false;
+            if (!kolibri1_graph_forward_tokens(&s->kolibri_gpu, &e->model, &e->weights,
+                                               prompt->v + i, chunk, s->logits)) {
+                snprintf(err, errlen, "Kolibri-1 prefill failed at token %d", i);
+                s->checkpoint_valid = false;
+                prefill_rc = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        if (prefill_rc != 0) return prefill_rc;
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -78059,6 +78486,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->checkpoint_valid = true;
         s->qwen4_rewound = false;
         s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_session_kolibri_uses_gpu(s)) {
+        ds4_engine *e = s->engine;
+        if (!s->kolibri_graph_ready) {
+            if (errlen) snprintf(err, errlen, "Kolibri-1 graph is not initialized");
+            return 1;
+        }
+        if (s->kolibri_gpu.pos >= s->kolibri_gpu.ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!kolibri1_graph_forward_token(&s->kolibri_gpu, &e->model, &e->weights, token, s->logits)) {
+            if (errlen) snprintf(err, errlen, "Kolibri-1 decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
         (void)probe_mtp;
         return 0;
     }
