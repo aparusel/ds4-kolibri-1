@@ -8063,6 +8063,7 @@ typedef enum {
     DSML_TRACK_STRUCTURAL,
     DSML_TRACK_STRING_BODY,
     DSML_TRACK_JSON_PARAM,
+    DSML_TRACK_JSON_BODY,
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
@@ -8106,6 +8107,14 @@ static const dsml_syntax glm_tool_syntax = {
 static const dsml_syntax qwen_tool_syntax = {
     "<tool_call>", "</tool_call>",
     "<function=", "</function>", "<parameter=", "</parameter>",
+};
+
+/* Kolibri/JSON calls have no inner tags: the whole body between the call
+ * tags is one JSON object.  The tracker scans it with JSON string state so a
+ * literal end tag inside an argument string cannot close the call. */
+static const dsml_syntax kolibri_tool_syntax = {
+    "<tool_call>", "</tool_call>",
+    NULL, NULL, NULL, NULL,
 };
 
 typedef struct {
@@ -8316,9 +8325,12 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             const dsml_syntax *syn = NULL;
             bool found;
             if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
-                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+                dt->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
                 syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
-                    &qwen_tool_syntax : &glm_tool_syntax;
+                    &qwen_tool_syntax :
+                    (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ?
+                     &glm_tool_syntax : &kolibri_tool_syntax);
                 const char *start = find_lit_bounded(raw + dt->pos,
                     raw_len - dt->pos, syn->tool_calls_start);
                 found = start != NULL;
@@ -8336,8 +8348,16 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             }
             dt->syn = syn;
             dt->pos = pos;
-            dt->mode = DSML_TRACK_STRUCTURAL;
-            dt->decode = DSML_DECODE_STRUCTURAL;
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+                /* nothing but JSON between the call tags */
+                dt->mode = DSML_TRACK_JSON_BODY;
+                dt->json_in_string = false;
+                dt->json_escaped = false;
+                dt->decode = DSML_DECODE_JSON_STRUCTURAL;
+            } else {
+                dt->mode = DSML_TRACK_STRUCTURAL;
+                dt->decode = DSML_DECODE_STRUCTURAL;
+            }
         }
 
         if (dt->mode == DSML_TRACK_STRING_BODY) {
@@ -8371,6 +8391,42 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                         goto structural;
                     }
                     if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                        dt->decode = raw_len - dt->pos >= 2 ?
+                            DSML_DECODE_STRUCTURAL : DSML_DECODE_JSON_STRUCTURAL;
+                        return;
+                    }
+                }
+
+                unsigned char c = (unsigned char)raw[dt->pos++];
+                if (dt->json_in_string) {
+                    if (dt->json_escaped) {
+                        dt->json_escaped = false;
+                    } else if (c == '\\') {
+                        dt->json_escaped = true;
+                    } else if (c == '"') {
+                        dt->json_in_string = false;
+                    }
+                } else if (c == '"') {
+                    dt->json_in_string = true;
+                }
+            }
+            dt->decode = dt->json_in_string ?
+                DSML_DECODE_JSON_STRING : DSML_DECODE_JSON_STRUCTURAL;
+            return;
+        }
+
+        if (dt->mode == DSML_TRACK_JSON_BODY) {
+            /* Kolibri: the call body is one JSON object; </tool_call> outside
+             * a JSON string ends it and the tracker is done. */
+            while (dt->pos < raw_len) {
+                if (!dt->json_in_string) {
+                    if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
+                        dt->pos += strlen(dt->syn->tool_calls_end);
+                        dt->mode = DSML_TRACK_DONE;
+                        dt->decode = DSML_DECODE_OUTSIDE;
+                        return;
+                    }
+                    if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
                         dt->decode = raw_len - dt->pos >= 2 ?
                             DSML_DECODE_STRUCTURAL : DSML_DECODE_JSON_STRUCTURAL;
                         return;
@@ -21669,6 +21725,57 @@ static void test_qwen_decode_tracker_markers(void) {
     TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
 }
 
+static void test_kolibri_decode_tracker_markers(void) {
+    /* The JSON body is scanned as payload: a literal end tag inside an
+     * argument string must not close the call. */
+    const char *raw =
+        "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+        "{\"content\": \"literal </tool_call> text\", \"path\": \"/tmp/x\"}}\n"
+        "</tool_call>";
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    bool start = false, end = false, orphan = false;
+    size_t len = strlen(raw);
+    for (size_t n = 1; n <= len; n++) {
+        dsml_decode_tracker_update(&tracker, raw, n);
+        char *prefix = xstrndup(raw, n);
+        bool s = false, e = false, o = false;
+        observe_tool_markers(&tracker, prefix, &s, &e, &o);
+        free(prefix);
+        if (s) start = true;
+        if (e) end = true;
+        if (o) orphan = true;
+        TEST_ASSERT(!e || n == len);
+    }
+    TEST_ASSERT(start && end);
+    TEST_ASSERT(!orphan);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+
+    /* payload sampling follows JSON string state */
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    const char *struct_part = "<tool_call>\n{\"name\": \"ls\", \"arguments\": ";
+    dsml_decode_tracker_update(&tracker, struct_part, strlen(struct_part));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRUCTURAL);
+    TEST_ASSERT(!dsml_decode_state_uses_payload_sampling(tracker.decode));
+    const char *str_part =
+        "<tool_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \"/tmp/a";
+    dsml_decode_tracker_update(&tracker, str_part, strlen(str_part));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRING);
+    TEST_ASSERT(dsml_decode_state_uses_payload_sampling(tracker.decode));
+
+    /* whitespace before a partial closing tag stays a structural hold */
+    const char *tail =
+        "<tool_call>\n{\"name\": \"ls\", \"arguments\": {}}\n</tool_call";
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    dsml_decode_tracker_update(&tracker, tail, strlen(tail));
+    TEST_ASSERT(tracker.mode == DSML_TRACK_JSON_BODY);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_STRUCTURAL);
+}
+
 static void test_tool_body_escape_round_trip(void) {
     const char *ends[] = {DS4_PARAM_END, "</arg_key>", "</arg_value>",
                          "</tool_result>", "</tool_response>"};
@@ -24006,6 +24113,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
+    test_kolibri_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
