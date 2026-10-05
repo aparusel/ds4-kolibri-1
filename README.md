@@ -9,7 +9,8 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 **DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
+**DeepSeek V4 PRO**, **Qwen3.8 Flash Next** (Metal and CUDA), and
+**Kolibri-1** (Metal). The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
@@ -134,7 +135,8 @@ Run each binary with `--help` for its full options.
 
 `ds4-agent` runs inference directly, without a separate HTTP server. It keeps
 the token history and live model state together, shows prefill progress, and
-uses the model's native tool format. DeepSeek and GLM have their own templates.
+uses the model's native tool format. DeepSeek, GLM, Qwen, and Kolibri-1 have
+their own templates.
 
 Use `/hints on` for occasional, brief explanations of the programming choices
 behind the work, and `/hints off` to stop them. Changes take effect at the next
@@ -192,6 +194,22 @@ Add `--mtp` for speculative decoding. The larger
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
 
+Kolibri-1 is Aleph Alpha's 78.10B-parameter mixture-of-experts model with
+3.46B active parameters (Apache 2.0). There is no `download_model.sh` target;
+build the GGUF from the released `Aleph-Alpha/Kolibri-1` checkpoint (FP8 or
+BF16) with the [Kolibri converter](gguf-tools/README.md#convert-kolibri-1).
+The recipes produce roughly 146 GiB (f16), 77.4 GiB (q8), 43 GiB (q4), or
+23 GiB (q2) files, with norms, routers, and the shared expert in higher
+precision. Kolibri-1 runs on Metal and the CPU reference backend; CUDA, ROCm,
+tensor and pipeline parallelism, SSD streaming, speculation, and vision are
+not supported.
+
+Thinking is enabled by default, and `--think-level` selects the released low,
+medium, or high effort wording. The native agent and HTTP server speak the
+released tool-call format, and the server lists the model as `kolibri-1`.
+Native context is 262,144 tokens, and the 40 sliding-attention layers use a
+windowed KV ring: about 12 GiB of KV at full context instead of 54 GiB.
+
 Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
@@ -204,9 +222,13 @@ answers, and `--think` or `/think` to enable it again.
 For V4.1, `ds4` and `ds4-agent` also accept
 `--think-level 25` or `/think 25`: 1 to 100 sets the reasoning effort, and
 0 disables thinking. `--think` selects 75, `--think-max` selects 100.
+Kolibri-1 accepts `--think-level N` at startup and maps it to its released
+low, medium, and high effort sentences.
 Changing the level in a conversation rebuilds its cached prefix.
 The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
-`--temp 0` selects greedy output.
+`--temp 0` selects greedy output. Kolibri-1 instead applies its released
+defaults: temperature 1, top-p 0.97, and top-k 128, with min-p off
+(`--top-k` overrides the cut).
 
 For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
 The default is 100. V4.1 and GLM currently require `--power 100`.
