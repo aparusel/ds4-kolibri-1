@@ -147,18 +147,22 @@ pass it at runtime with `--vision`.
 ## Kolibri-1
 
 Kolibri-1 is Aleph Alpha's 78.10B-parameter mixture-of-experts model with
-3.46B active parameters (Apache 2.0). There is no `download_model.sh` target;
-build the GGUF from the released `Aleph-Alpha/Kolibri-1` checkpoint (the FP8
-snapshot or `Kolibri-1-BF16`) with the
-[Kolibri converter](../gguf-tools/README.md#convert-kolibri-1). The `--quant`
-flag selects the routed-expert format:
+3.46B active parameters (Apache 2.0). Prebuilt Q8, Q4 and Q2 GGUFs with
+published SHA-256 checksums are on
+[aparusel/kolibri-1-gguf](https://huggingface.co/aparusel/kolibri-1-gguf);
+`download_model.sh` fetches them into `gguf/` and verifies size and checksum.
+The `--quant` flag selects the routed-expert format when building locally:
 
-| Recipe | Routed experts | File size |
-| --- | --- | ---: |
-| `--quant f16` | F16 | about 146 GiB |
-| `--quant q8` | Q8_0 | 77.4 GiB |
-| `--quant q4` | Q4_K | about 43 GiB |
-| `--quant q2` | IQ2_XXS gate/up, Q2_K down | about 23 GiB |
+| Recipe | Routed experts | File size | Download target |
+| --- | --- | ---: | --- |
+| `--quant f16` | F16 | about 146 GiB | build locally |
+| `--quant q8` | Q8_0 | 77.4 GiB | `./download_model.sh kolibri1-q8` |
+| `--quant q4` | Q4_K | about 43 GiB | `./download_model.sh kolibri1-q4` |
+| `--quant q2` | IQ2_XXS gate/up, Q2_K down | about 23 GiB | `./download_model.sh kolibri1-q2` |
+
+To build f16 or reproduce a conversion from the released
+`Aleph-Alpha/Kolibri-1` checkpoint (the FP8 snapshot or `Kolibri-1-BF16`),
+use the [Kolibri converter](../gguf-tools/README.md#convert-kolibri-1):
 
 ```sh
 make -C gguf-tools libds4quants.dylib

@@ -117,7 +117,7 @@ on a smaller Mac.
 With less RAM, start from Kolibri-1: its Q2 file is about 23 GiB.
 
 ```sh
-hf download aparusel/kolibri-1-gguf Kolibri-1-Q2.gguf --local-dir gguf
+./download_model.sh kolibri1-q2
 ./ds4 -m gguf/Kolibri-1-Q2.gguf
 ```
 
@@ -236,10 +236,11 @@ weights.
 
 Prebuilt Q8, Q4, and Q2 GGUFs, converted from the FP8 release with a pinned
 source revision and SHA-256 checksums, are on
-[Hugging Face](https://huggingface.co/aparusel/kolibri-1-gguf):
+[Hugging Face](https://huggingface.co/aparusel/kolibri-1-gguf); the
+`download_model.sh` targets fetch them into `gguf/` and verify the checksums:
 
 ```sh
-hf download aparusel/kolibri-1-gguf Kolibri-1-Q4.gguf --local-dir gguf
+./download_model.sh kolibri1-q4
 ./ds4 -m gguf/Kolibri-1-Q4.gguf
 ```
 
