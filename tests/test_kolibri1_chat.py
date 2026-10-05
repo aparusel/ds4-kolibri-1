@@ -59,6 +59,7 @@ def ds4_ids(rendered: str) -> list[int]:
 
 
 AGENT_DRIVER = str(ROOT / "tests" / "test_kolibri1_agent_chat")
+SERVER_DRIVER = str(ROOT / "tests" / "test_kolibri1_server_render")
 
 AGENT_SYSTEM_TEXT = "You are a coding agent running in a local workspace."
 AGENT_USER_TEXT = "List the files here, then read the first one."
@@ -114,6 +115,96 @@ def agent_reference_ids(tools_section: str, rules: str) -> list[int]:
     rendered = template.render(messages=messages, tools=tools,
                                add_generation_prompt=True)
     return tok.encode(rendered).ids
+
+
+def server_rendered(body: dict, effort: str) -> str:
+    """Render a request body through the ds4-server Kolibri renderer."""
+    proc = subprocess.run([SERVER_DRIVER, "--effort", effort],
+                          input=json.dumps(body), capture_output=True, text=True,
+                          cwd=str(ROOT))
+    if proc.returncode != 0:
+        raise RuntimeError(f"server render driver failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+SERVER_TOOLS = [{"type": "function", "function": {
+    "name": "ls", "parameters": {"type": "object", "properties": {
+        "path": {"type": "string"}}}}}]
+
+SERVER_CASES = [
+    # (name, request body, jinja kwargs, effort)
+    ("server-system+user",
+     {"messages": [{"role": "system", "content": "You are terse."},
+                   {"role": "user", "content": "Hello"}]},
+     {}, "high"),
+    ("server-nothink",
+     {"messages": [{"role": "user", "content": "Hello"}]},
+     {}, "none"),
+    ("server-system+effort-low",
+     {"messages": [{"role": "system", "content": "You are terse."},
+                   {"role": "user", "content": "Hello"}]},
+     {}, "low"),
+    ("server-tools-calls-results",
+     {"messages": [
+         {"role": "user", "content": "check both"},
+         {"role": "assistant", "content": "", "tool_calls": [
+             {"type": "function", "id": "call_1", "function": {
+                 "name": "ls", "arguments": "{\"path\": \".\"}"}},
+             {"type": "function", "id": "call_2", "function": {
+                 "name": "cat", "arguments": "{\"path\": \"a b/c\"}"}}]},
+         {"role": "tool", "content": "a\nb"},
+         {"role": "tool", "content": "line1"},
+         {"role": "user", "content": "summarize"},
+      ],
+      "tools": SERVER_TOOLS},
+     {}, "high"),
+    ("server-assistant-replay-reasoning",
+     {"messages": [
+         {"role": "user", "content": "one"},
+         {"role": "assistant", "content": "answer one",
+          "reasoning": "because 2+2=4"},
+         {"role": "user", "content": "two"},
+      ]},
+     {}, "high"),
+    ("server-embedded-think",
+     {"messages": [
+         {"role": "user", "content": "one"},
+         {"role": "assistant", "content": "<think>\nbecause\n</think>\nanswer one"},
+         {"role": "user", "content": "two"},
+      ]},
+     {}, "high"),
+]
+
+
+def run_server_cases() -> int:
+    """Byte-compare the server renderer against the released template."""
+    failures = 0
+    for name, body, kwargs, effort in SERVER_CASES:
+        rendered = template.render(messages=body["messages"],
+                                   tools=body.get("tools"),
+                                   add_generation_prompt=True,
+                                   reasoning_effort=effort, **kwargs)
+        try:
+            got = server_rendered(body, effort)
+        except RuntimeError as exc:
+            failures += 1
+            print(f"kolibri1-chat: {name:32s} DRIVER FAILED ({exc})")
+            continue
+        if got == rendered:
+            print(f"kolibri1-chat: {name:32s} {len(got):4d} chars OK")
+            continue
+        failures += 1
+        print(f"kolibri1-chat: {name:32s} MISMATCH "
+              f"(driver {len(got)} vs ref {len(rendered)} chars)")
+        for i, (g, r) in enumerate(zip(got, rendered)):
+            if g != r:
+                lo = max(0, i - 25)
+                print(f"    first diff at {i}:\n    driver {got[lo:i+25]!r}\n"
+                      f"    ref    {rendered[lo:i+25]!r}")
+                break
+        else:
+            print("    length differs after the common prefix")
+    return failures
 
 
 CASES = [
@@ -206,6 +297,10 @@ def main() -> int:
                 print(f"    length differs after {min(len(got), len(ref))}")
     except RuntimeError as exc:
         print(f"kolibri1-chat: agent transcript skipped ({exc})")
+
+    # Server renderer: the ds4-server prompt text must byte-match the
+    # released template for request-shaped conversations.
+    failures += run_server_cases()
 
     if failures:
         print(f"kolibri1-chat: {failures} case(s) FAILED")

@@ -976,6 +976,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_KOLIBRI,
 } server_model_syntax;
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
@@ -1516,6 +1517,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_kolibri1(engine)) return SERVER_MODEL_SYNTAX_KOLIBRI;
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
@@ -3916,6 +3918,234 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+/* Kolibri-1 server renderer. Semantics come from the released template in
+ * the GGUF metadata and are gated by tests/test_kolibri1_chat.py; the marker
+ * spellings are plain text that ds4_tokenize_rendered_chat maps back to the
+ * added-token ids. The tool-call tag literals are split across string
+ * literals so this source never carries the contiguous marker sequences
+ * (handover §12.4 item 4: agent tool channels garble them). */
+
+static void append_kolibri_tool_response(buf *b, const char *text, size_t len) {
+    buf_puts(b, "\n<tool_response>\n");
+    buf_append(b, text ? text : "", len);
+    buf_puts(b, "\n</tool_response>");
+}
+
+static void append_kolibri_tool_result_message(buf *b, const chat_msg *m) {
+    const char *content = m && m->content ? m->content : "";
+    if (m && m->role && !strcmp(m->role, "user") && m->tool_call_ids_len > 0) {
+        static const char open[] = "<tool_result>";
+        static const char close[] = "</tool_result>";
+        const char *p = content;
+        bool found = false;
+        while ((p = strstr(p, open)) != NULL) {
+            const char *body = p + sizeof(open) - 1;
+            const char *end = strstr(body, close);
+            if (!end) break;
+            append_kolibri_tool_response(b, body, (size_t)(end - body));
+            found = true;
+            p = end + sizeof(close) - 1;
+        }
+        if (found) return;
+    }
+    append_kolibri_tool_response(b, content, strlen(content));
+}
+
+static void append_kolibri_tools_section(buf *b, const char *tool_schemas) {
+    buf_puts(b,
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>");
+    const char *p = tool_schemas ? tool_schemas : "";
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        /* parse_tools_value stores the inner function object; the released
+         * template renders the full OpenAI tool object through `tojson`. */
+        const char *prefix = "{\"function\": ";
+        const char *suffix = ", \"type\": \"function\"}";
+        size_t n = strlen(raw) + strlen(prefix) + strlen(suffix) + 1;
+        char *wrapped = xmalloc(n);
+        snprintf(wrapped, n, "%s%s%s", prefix, raw, suffix);
+        char *sorted = json_tojson_sorted(wrapped);
+        if (sorted) {
+            buf_puts(b, "\n");
+            buf_puts(b, sorted);
+        }
+        free(sorted);
+        free(wrapped);
+        free(raw);
+        json_ws(&p);
+    }
+    buf_puts(b,
+        "\n</tools>\n\n"
+        "For each function call, return a json object with function name and arguments within "
+        "<tool" "_call></tool" "_call> XML tags:\n"
+        "<tool" "_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+        "</tool" "_call>");
+}
+
+static const char *kolibri_last_strstr(const char *s, const char *needle) {
+    const char *last = NULL;
+    for (const char *p = strstr(s, needle); p; p = strstr(p + 1, needle)) last = p;
+    return last;
+}
+
+/* Assistant replay. `index0` is the message's index in the conversation and
+ * `last_query_index` the template's backward walk for the last real user
+ * query: think blocks render only after that query (or under
+ * preserve_thinking, which the server does not thread yet). */
+static void append_kolibri_assistant_message(buf *out, const chat_msg *m,
+                                             int index0, int last_query_index) {
+    const char *content = m && m->content ? m->content : "";
+    const char *reasoning = m && m->reasoning ? m->reasoning : NULL;
+    size_t reasoning_len = reasoning ? strlen(reasoning) : 0;
+    /* Template fallback: without a structured reasoning field, an embedded
+     * think block in the content splits into reasoning plus content (first
+     * closing tag wins for the prefix, last one for the remainder). */
+    if (!reasoning && strstr(content, "</think>")) {
+        const char *first_close = strstr(content, "</think>");
+        const char *last_close = kolibri_last_strstr(content, "</think>");
+        const char *rbegin = content;
+        for (const char *p = strstr(content, "<think>");
+             p && p < first_close;
+             p = strstr(p + 1, "<think>"))
+            rbegin = p + strlen("<think>");
+        const char *rend = first_close;
+        while (rbegin < rend && *rbegin == '\n') rbegin++;
+        while (rend > rbegin && rend[-1] == '\n') rend--;
+        reasoning = rbegin;
+        reasoning_len = (size_t)(rend - rbegin);
+        content = last_close + strlen("</think>");
+    }
+    buf_puts(out, "<|im_start|>assistant\n");
+    if (index0 > last_query_index) {
+        buf_puts(out, "<think>\n");
+        if (reasoning) {
+            const char *rs = reasoning;
+            const char *re = reasoning + reasoning_len;
+            while (rs < re && isspace((unsigned char)*rs)) rs++;
+            while (re > rs && isspace((unsigned char)re[-1])) re--;
+            if (rs < re) {
+                while (reasoning_len && *reasoning == '\n') {
+                    reasoning++;
+                    reasoning_len--;
+                }
+                while (reasoning_len && reasoning[reasoning_len - 1] == '\n')
+                    reasoning_len--;
+                buf_append(out, reasoning, reasoning_len);
+            }
+        }
+        buf_puts(out, "\n</think>\n\n");
+    }
+    const bool content_truthy = content[0] != '\0';
+    while (*content == '\n') content++;
+    buf_puts(out, content);
+    if (m && m->calls.len > 0) {
+        for (int i = 0; i < m->calls.len; i++) {
+            const tool_call *tc = &m->calls.v[i];
+            if ((i == 0 && content_truthy) || i > 0) buf_puts(out, "\n");
+            buf_puts(out, "<tool" "_call>\n{\"name\": \"");
+            buf_puts(out, tc->name ? tc->name : "");
+            buf_puts(out, "\", \"arguments\": ");
+            /* the template emits string arguments verbatim; sampled text must
+             * survive replay byte-for-byte, so never re-serialize here */
+            buf_puts(out, tc->arguments ? tc->arguments : "");
+            buf_puts(out, "}\n</tool" "_call>");
+        }
+    }
+    buf_puts(out, "<|im_end|>\n");
+}
+
+static int kolibri_last_query_index(const chat_msgs *msgs) {
+    int last = msgs ? msgs->len - 1 : -1;
+    for (int i = msgs ? msgs->len - 1 : -1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role || strcmp(m->role, "user") || !m->content) continue;
+        static const char open[] = "<tool_response>";
+        static const char close[] = "</tool_response>";
+        const size_t n = strlen(m->content);
+        if (n >= sizeof(close) - 1 &&
+            !strncmp(m->content, open, sizeof(open) - 1) &&
+            !strcmp(m->content + n - (sizeof(close) - 1), close))
+            continue;
+        return i;
+    }
+    return last;
+}
+
+static char *render_kolibri_chat_prompt_text(const chat_msgs *msgs,
+                                             const char *tool_schemas,
+                                             ds4_think_mode think_mode) {
+    const char *effort = ds4_kolibri_reasoning_effort_text(think_mode);
+    const bool have_tools = tool_schemas && tool_schemas[0];
+    const bool has_system = msgs && msgs->len > 0 && role_is_system(msgs->v[0].role);
+    buf out = {0};
+    /* The effort sentence is never absent, so the system block is always
+     * emitted; messages[0] is the only system message folded into it. */
+    buf_puts(&out, "<|im_start|>system\n");
+    if (has_system) {
+        buf_puts(&out, msgs->v[0].content ? msgs->v[0].content : "");
+        buf_puts(&out, "\n\n");
+    }
+    buf_puts(&out, "# Reasoning effort\n\n");
+    buf_puts(&out, effort);
+    if (have_tools) {
+        buf_puts(&out, "\n\n");
+        append_kolibri_tools_section(&out, tool_schemas);
+    }
+    buf_puts(&out, "<|im_end|>\n");
+
+    const int last_query_index = kolibri_last_query_index(msgs);
+    const bool thinking = ds4_think_mode_enabled(think_mode);
+    bool tool_open = false;
+    bool pending_assistant = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i == 0 && role_is_system(m->role)) continue;
+        if (role_is_system(m->role)) {
+            if (tool_open) {
+                buf_puts(&out, "<|im_end|>\n");
+                tool_open = false;
+            }
+            buf_puts(&out, "<|im_start|>system\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = true;
+            continue;
+        }
+        if (chat_msg_is_glm_tool_result(m)) {
+            if (!tool_open) buf_puts(&out, "<|im_start|>user");
+            append_kolibri_tool_result_message(&out, m);
+            tool_open = true;
+            pending_assistant = true;
+            continue;
+        }
+        if (tool_open) {
+            buf_puts(&out, "<|im_end|>\n");
+            tool_open = false;
+        }
+        if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_kolibri_assistant_message(&out, m, i, last_query_index);
+            pending_assistant = false;
+        }
+    }
+    if (tool_open) buf_puts(&out, "<|im_end|>\n");
+    if (pending_assistant) {
+        buf_puts(&out, "<|im_start|>assistant\n");
+        if (!thinking) buf_puts(&out, "<think>\n\n</think>\n\n");
+    }
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3929,6 +4159,9 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
         return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return render_kolibri_chat_prompt_text(msgs, tool_schemas, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
@@ -18689,6 +18922,171 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_kolibri_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    /* Jinja expectations below were rendered with the same
+     * ImmutableSandboxedEnvironment as tests/test_kolibri1_chat.py. */
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|im_start|>system\nYou are terse.\n\n# Reasoning effort\n\n"
+        "Reasoning effort is set to high. Think carefully through the task in the user's language, "
+        "validate key assumptions, consider plausible alternatives, and prioritize correctness and clarity."
+        "<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"));
+    free(prompt);
+
+    /* thinking disabled: the "disabled" sentence plus the empty think block */
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|im_start|>system\nYou are terse.\n\n# Reasoning effort\n\n"
+        "Reasoning is disabled. Proceed straight to answering according to the user's instructions."
+        "<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    /* tools + assistant calls + grouped tool results + trailing user */
+    chat_msgs conv = {0};
+    chat_msg c_user = {0};
+    c_user.role = xstrdup("user");
+    c_user.content = xstrdup("check both");
+    chat_msgs_push(&conv, c_user);
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.content = xstrdup("");
+    {
+        tool_call tc1 = {.name = xstrdup("ls"), .arguments = xstrdup("{\"path\": \".\"}")};
+        tool_call tc2 = {.name = xstrdup("cat"), .arguments = xstrdup("{\"path\": \"a b/c\"}")};
+        tool_calls_push(&asst.calls, tc1);
+        tool_calls_push(&asst.calls, tc2);
+    }
+    chat_msgs_push(&conv, asst);
+    chat_msg t1 = {0};
+    t1.role = xstrdup("tool");
+    t1.content = xstrdup("a\nb");
+    chat_msgs_push(&conv, t1);
+    chat_msg t2 = {0};
+    t2.role = xstrdup("tool");
+    t2.content = xstrdup("line1");
+    chat_msgs_push(&conv, t2);
+    chat_msg c_user2 = {0};
+    c_user2.role = xstrdup("user");
+    c_user2.content = xstrdup("summarize");
+    chat_msgs_push(&conv, c_user2);
+
+    const char *tool_schemas =
+        "{\"name\":\"ls\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"}}}}";
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &conv, tool_schemas, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    /* no system message: the effort sentence opens the system block */
+    TEST_ASSERT(!strncmp(prompt,
+        "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to high.", 69));
+    /* schemas come out in jinja tojson spelling */
+    TEST_ASSERT(strstr(prompt,
+        "\n{\"function\": {\"name\": \"ls\", \"parameters\": {\"properties\": "
+        "{\"path\": {\"type\": \"string\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n"
+        "</tools>") != NULL);
+    /* assistant stanzas: empty content, two calls, one newline between */
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n"
+        "<tool_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n</tool_call>\n"
+        "<tool_call>\n{\"name\": \"cat\", \"arguments\": {\"path\": \"a b/c\"}}\n</tool_call>"
+        "<|im_end|>\n") != NULL);
+    /* consecutive tool results group into one user turn with a deferred close */
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\n"
+        "<tool_response>\na\nb\n</tool_response>\n"
+        "<tool_response>\nline1\n</tool_response>"
+        "<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\nsummarize<|im_end|>\n<|im_start|>assistant\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&conv);
+
+    /* reasoning replay: dropped before the last query, rendered after it */
+    chat_msgs replay = {0};
+    chat_msg r1 = {0};
+    r1.role = xstrdup("user");
+    r1.content = xstrdup("one");
+    chat_msgs_push(&replay, r1);
+    chat_msg r2 = {0};
+    r2.role = xstrdup("assistant");
+    r2.content = xstrdup("answer one");
+    r2.reasoning = xstrdup("because 2+2=4");
+    chat_msgs_push(&replay, r2);
+    chat_msg r3 = {0};
+    r3.role = xstrdup("user");
+    r3.content = xstrdup("two");
+    chat_msgs_push(&replay, r3);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &replay, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "because") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\nanswer one<|im_end|>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&replay);
+
+    chat_msgs tail = {0};
+    chat_msg q1 = {0};
+    q1.role = xstrdup("user");
+    q1.content = xstrdup("one");
+    chat_msgs_push(&tail, q1);
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.content = xstrdup("answer one");
+    a1.reasoning = xstrdup("because 2+2=4");
+    chat_msgs_push(&tail, a1);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &tail, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\nbecause 2+2=4\n</think>\n\n"
+        "answer one<|im_end|>\n") != NULL);
+    /* assistant-final replay stops at the replayed turn (no fresh prefix) */
+    TEST_ASSERT(strstr(prompt, "answer one<|im_end|>\n<|im_start|>assistant\n") == NULL);
+    free(prompt);
+    chat_msgs_free(&tail);
+
+    /* embedded think block splits into reasoning + content (reasoning then
+     * dropped because the turn sits before the last query) */
+    chat_msgs embedded = {0};
+    chat_msg e1 = {0};
+    e1.role = xstrdup("user");
+    e1.content = xstrdup("one");
+    chat_msgs_push(&embedded, e1);
+    chat_msg e2 = {0};
+    e2.role = xstrdup("assistant");
+    e2.content = xstrdup("<think>\nbecause\n</think>\nanswer one");
+    chat_msgs_push(&embedded, e2);
+    chat_msg e3 = {0};
+    e3.role = xstrdup("user");
+    e3.content = xstrdup("two");
+    chat_msgs_push(&embedded, e3);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &embedded, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "because") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\nanswer one<|im_end|>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&embedded);
+}
+
 static void test_render_qwen_chat_prompt_text(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -23311,6 +23709,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
+    test_render_kolibri_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();

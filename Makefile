@@ -749,7 +749,7 @@ test-kolibri1-torch: ds4
 	python3 tests/test_kolibri1_torch.py --gguf "$(KOLIBRI1_MINI_GGUF)"
 
 .PHONY: test-kolibri1-chat
-test-kolibri1-chat: ds4 tests/test_kolibri1_agent_chat
+test-kolibri1-chat: ds4 tests/test_kolibri1_agent_chat tests/test_kolibri1_server_render
 	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
 		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
 	python3 tests/test_kolibri1_chat.py
@@ -762,6 +762,16 @@ ifeq ($(UNAME_S),Darwin)
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ tests/test_kolibri1_agent_chat.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
 	$(DS4_LINK) -o $@ tests/test_kolibri1_agent_chat.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+endif
+
+tests/test_kolibri1_server_render.o: tests/test_kolibri1_server_render.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_kolibri1_server_render: tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
