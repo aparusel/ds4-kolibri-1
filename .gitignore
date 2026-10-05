@@ -91,3 +91,4 @@ __pycache__/
 /tests/test_kolibri1_agent_chat
 /tests/test_kolibri1_server_render
 /tests/test_kolibri1_session
+/tests/test_cli_printer
