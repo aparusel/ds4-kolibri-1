@@ -76791,6 +76791,35 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 #endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        if (ds4_model_is_kolibri1()) {
+            /* Kolibri-1 replays a continuation suffix through the same
+             * per-token reference as prefill and decode; the generic decode
+             * path below reads DeepSeek tensor layouts. */
+            if (s->checkpoint_valid &&
+                prompt->len >= s->checkpoint.len &&
+                ds4_tokens_starts_with(prompt, &s->checkpoint))
+            {
+                s->mtp_draft_valid = false;
+                for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                    if (ds4_session_cancelled(s)) {
+                        snprintf(err, errlen, "interrupted");
+                        s->checkpoint_valid = true;
+                        s->mtp_draft_valid = false;
+                        return DS4_SESSION_SYNC_INTERRUPTED;
+                    }
+                    kolibri1_forward_token_cpu(s->logits, &e->model, &e->weights,
+                                               &s->kolibri1_cpu, prompt->v[i],
+                                               (uint32_t)s->checkpoint.len,
+                                               &s->kolibri1_cpu_scratch);
+                    token_vec_push(&s->checkpoint, prompt->v[i]);
+                    if (s->progress)
+                        s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+                }
+                s->checkpoint_valid = true;
+                return 0;
+            }
+            return session_cpu_prefill_tokens(s, prompt, err, errlen);
+        }
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -76823,11 +76852,6 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
 
         session_cpu_reset_cache(s);
-        if (ds4_model_is_kolibri1()) {
-            const int rc = session_cpu_prefill_tokens(s, prompt, err, errlen);
-            if (rc != 0) return rc;
-            return 0;
-        }
         prefill_layer_major_cpu(s->logits,
                                 &e->model,
                                 &e->weights,
