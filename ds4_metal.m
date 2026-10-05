@@ -50608,21 +50608,25 @@ int ds4_gpu_kolibri_attn_prep_tensor(
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, uint32_t cache_cap, uint32_t use_rope,
+        uint32_t pos0, uint32_t cache_rows, uint32_t use_rope,
         float rope_base, float eps) {
     struct {
-        uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, cache_cap, use_rope;
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, cache_rows, use_rope;
         float eps; float rope_freq[64];
-    } args = { n_tokens, n_head, n_head_kv, head_dim, pos0, cache_cap, use_rope, eps, { 0 } };
+    } args = { n_tokens, n_head, n_head_kv, head_dim, pos0, cache_rows, use_rope, eps, { 0 } };
     for (uint32_t i = 0; i < head_dim / 2u; i++)
         args.rope_freq[i] = powf(rope_base, -2.0f * (float)i / (float)head_dim);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * sizeof(float);
+    /* cache_rows != 0 is a ring holding max(pos)+1 slots; 0 means one row
+     * per absolute position up to the batch end. */
+    const uint64_t cache_bytes = (uint64_t)(cache_rows ? cache_rows : pos0 + n_tokens) *
+                                 n_head_kv * head_dim * sizeof(float);
     kolibri_bind b[8];
     if (n_tokens == 0 || head_dim == 0 || head_dim > 128u || (head_dim % 4u) != 0 ||
         head_dim > sizeof(args.rope_freq) / sizeof(args.rope_freq[0]) * 2u ||
-        (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        (cache_rows != 0 && n_tokens > cache_rows) ||
+        n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
         !kolibri_bind_tensor(&b[0], qproj, q_bytes, "attn q projection") ||
         !kolibri_bind_tensor(&b[1], kproj, kv_bytes, "attn k projection") ||
         !kolibri_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
@@ -50651,7 +50655,7 @@ int ds4_gpu_kolibri_attn_decode_tensor(
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
-        uint32_t pos0, uint32_t window, float scale) {
+        uint32_t pos0, uint32_t window, uint32_t cache_rows, float scale) {
     const uint32_t n_keys = pos0 + n_tokens;
     uint32_t n_splits = 1;
     if (part) {
@@ -50660,15 +50664,17 @@ int ds4_gpu_kolibri_attn_decode_tensor(
         if (n_splits > KOLIBRI_ATTN_MAX_SPLITS) n_splits = KOLIBRI_ATTN_MAX_SPLITS;
     }
     const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
-    struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, window, n_splits, keys_per_split;
+    struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, window, cache_rows, n_splits, keys_per_split;
              float scale; } args =
-        { n_tokens, n_head, n_head_kv, head_dim, pos0, window, n_splits, keys_per_split, scale };
+        { n_tokens, n_head, n_head_kv, head_dim, pos0, window, cache_rows, n_splits, keys_per_split, scale };
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)(cache_rows ? cache_rows : n_keys) *
+                                 n_head_kv * head_dim * sizeof(float);
     const uint64_t part_bytes = ds4_gpu_kolibri_attn_part_floats(n_tokens, n_head, head_dim) * sizeof(float);
     kolibri_bind b[5];
     if (n_tokens == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
         n_head / n_head_kv > 12u || head_dim == 0 || head_dim > 128u || (head_dim % 4u) != 0 ||
+        (cache_rows != 0 && n_tokens > cache_rows) ||
         !kolibri_bind_tensor(&b[0], q, q_bytes, "attn q") ||
         !kolibri_bind_tensor(&b[1], k_cache, cache_bytes, "k cache") ||
         !kolibri_bind_tensor(&b[2], v_cache, cache_bytes, "v cache") ||

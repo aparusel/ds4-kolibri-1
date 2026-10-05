@@ -39933,15 +39933,21 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 #ifdef DS4_HAS_KOLIBRI1_METAL
     if (ds4_backend_uses_graph(backend) && ds4_model_is_kolibri1()) {
-        /* Every layer keeps absolute-position f32 K/V rows for the whole
-         * context; transients scale with the prefill chunk. */
+        /* Full layers keep one f32 K/V row per absolute position; the 40
+         * sliding layers a ring of window + prefill-chunk rows (capped at
+         * the context, where it never wraps).  Transients scale with the
+         * prefill chunk. */
         const uint64_t T = prefill_chunk ? prefill_chunk : kolibri1_prefill_chunk_tokens(ctx);
         const uint64_t E = DS4_N_EMBD;
         const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t slide_rows = DS4_N_SWA + T < ctx ? DS4_N_SWA + T : ctx;
+        uint64_t cache_rows = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+            cache_rows += ds4_kolibri1_layer_is_full(il) ? ctx : slide_rows;
         m.prefill_cap = (uint32_t)T;
         m.raw_cap = ctx;
         m.comp_cap = 2u;
-        m.raw_bytes = (uint64_t)DS4_N_LAYER * ctx * kv_row * 2u;
+        m.raw_bytes = cache_rows * kv_row * 2u;
         m.scratch_bytes = T * (4u * E + (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM + 2u * (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM +
                                DS4_N_EXPERT + 2u * ((uint64_t)DS4_N_EXPERT_USED + 1u) * (DS4_N_FF_EXP + E)) * 4u;
         m.total_bytes = m.raw_bytes + m.scratch_bytes;
@@ -59891,15 +59897,17 @@ static int generate_qwen4_metal_argmax(
  * and every layer a top-6 sigmoid-router MoE plus an unweighted shared
  * expert.  One command batch per forward; f32 transients sized for
  * cap_tokens rows so the same kernels serve decode (T=1) and chunked
- * prefill.  K/V rows are absolute positions for every layer; the span a
- * row attends (last min(pos+1, window) rows on sliding layers, 0..pos on
- * full ones) is decided in the kernels, mirroring the CPU cache spans.
+ * prefill.  Full layers keep K/V rows at absolute positions and attend
+ * 0..pos; sliding layers keep a ring of window + chunk rows (so the cache
+ * costs the window, not the context) and attend the last min(pos+1, window)
+ * rows, mirroring the CPU cache spans.
  * --------------------------------------------------------------------- */
 
 typedef struct ds4_kolibri1_gpu_graph {
     uint32_t ctx_cap;
     uint32_t pos;
     uint32_t cap_tokens;
+    uint32_t slide_rows; /* sliding K/V ring rows: min(ctx, window + chunk) */
     bool owns_scratch;   /* false when the scratch is borrowed from the engine arena */
     ds4_gpu_tensor *R, *x, *blk, *attn_o, *moe_out, *logits;
     ds4_gpu_tensor *q, *kv;       /* [T][H*D] and [T][2*Hkv*D] projections */
@@ -59990,6 +59998,12 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     g->ctx_cap = ctx_cap;
     g->cap_tokens = cap_tokens;
+    /* Sliding layers hold only the window plus the in-flight chunk: a token
+     * attends the last DS4_N_SWA rows, and the current batch stages its rows
+     * before the attention runs, so no two positions within one window plus
+     * chunk collide modulo this ring.  Contexts shorter than that never wrap. */
+    g->slide_rows = DS4_N_SWA + cap_tokens;
+    if (g->slide_rows > ctx_cap) g->slide_rows = ctx_cap;
 
     bool ok = true;
     g->owns_scratch = shared == NULL;
@@ -60025,11 +60039,11 @@ private_state:
     KOLIBRI1_ALLOC(logits, DS4_N_VOCAB);
 #undef KOLIBRI1_ALLOC
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
-        /* Sliding layers only ever attend the last `window` rows, but the
-         * rows are absolute positions, so every layer reserves the full
-         * context; a windowed ring cache is a later memory optimization. */
-        g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * sizeof(float));
-        g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * sizeof(float));
+        /* Full layers keep one row per absolute position; sliding layers a
+         * ring of window + chunk rows (see slide_rows). */
+        const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? ctx_cap : g->slide_rows;
+        g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * sizeof(float));
+        g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * sizeof(float));
         ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il];
     }
     if (!ok) {
@@ -60060,6 +60074,7 @@ static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model 
                                      uint32_t pos0, uint32_t T) {
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint32_t full = ds4_kolibri1_layer_is_full(il);
+    const uint32_t cache_rows = full ? 0u : g->slide_rows;
     ds4_gpu_tensor *kproj = ds4_gpu_tensor_view(g->kv, 0, (uint64_t)T * kv_dim * sizeof(float));
     ds4_gpu_tensor *vproj = ds4_gpu_tensor_view(g->kv, (uint64_t)T * kv_dim * sizeof(float),
                                                 (uint64_t)T * kv_dim * sizeof(float));
@@ -60075,12 +60090,12 @@ static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model 
                                                g->q, kproj, vproj, m->map, m->size,
                                                l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                                T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                               pos0, g->ctx_cap, full ? 0u : 1u,
+                                               pos0, cache_rows, full ? 0u : 1u,
                                                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
               ds4_gpu_kolibri_attn_decode_tensor(g->attn_o, g->q, g->layer_k_cache[il], g->layer_v_cache[il],
                                                  T <= 2u ? g->attn_part : NULL, T,
                                                  DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0,
-                                                 full ? 0u : DS4_N_SWA,
+                                                 full ? 0u : DS4_N_SWA, cache_rows,
                                                  1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
               kolibri1_gemv(g->blk, m, l->attn_output, g->attn_o, T);
     ds4_gpu_tensor_free(kproj);

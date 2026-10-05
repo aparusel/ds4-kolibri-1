@@ -3,9 +3,10 @@
 // (top-k on logit + expert bias, weights = sigmoid(logit) unnormalized) and
 // the routed/shared MoE sum.  Transients and the K/V caches are f32, which
 // keeps the graph comparable to kolibri1_forward_token_cpu on the F32
-// fixture; the real artifact differs only in the Q8 weight path.  KV rows
-// are absolute positions for every layer (window or not); a windowed ring
-// cache is a later memory optimization, not a semantic difference.
+// fixture; the real artifact differs only in the Q8 weight path.  Full
+// layers address KV rows by absolute position; the sliding layers keep a
+// ring of window + prefill-chunk rows (cache_rows, 0 = absolute) and store
+// at pos % cache_rows, so their caches cost the window, not the context.
 
 struct ds4_metal_args_kolibri_attn_prep {
     uint32_t n_tokens;
@@ -13,8 +14,8 @@ struct ds4_metal_args_kolibri_attn_prep {
     uint32_t n_head_kv;
     uint32_t head_dim;
     uint32_t pos0;
-    uint32_t cache_cap;
-    uint32_t use_rope;   /* sliding layers rope, full layers do not */
+    uint32_t cache_rows;  /* 0 = absolute-position rows; else ring modulus */
+    uint32_t use_rope;    /* sliding layers rope, full layers do not */
     float    eps;
     float    rope_freq[64];
 };
@@ -80,7 +81,7 @@ kernel void kernel_kolibri_attn_prep(
     const uint H = args.n_head, Hkv = args.n_head_kv, D = args.head_dim;
     if (tok >= args.n_tokens || slot > H + Hkv) return;
     const uint pos = args.pos0 + tok;
-    const uint64_t cache_row = pos;
+    const uint cache_row = args.cache_rows ? (pos % args.cache_rows) : pos;
     threadgroup float staged[128];
 
     if (slot < H) {
@@ -165,6 +166,7 @@ struct ds4_metal_args_kolibri_attn {
     uint32_t head_dim;
     uint32_t pos0;
     uint32_t window;       /* sliding-window rows; 0 = full span 0..pos */
+    uint32_t cache_rows;   /* 0 = absolute-position rows; else ring modulus */
     uint32_t n_splits;     /* key ranges per (kv head, token); 1 writes out */
     uint32_t keys_per_split;
     float    scale;
@@ -209,8 +211,9 @@ static inline void kolibri_attn_decode_tile(
     }
     for (uint idx = k0; idx < k1; idx++) {
         const uint p = start + idx;
-        device const float *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D;
-        device const float *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D;
+        const uint row = args.cache_rows ? (p % args.cache_rows) : p;
+        device const float *kr = k_cache + ((uint64_t)row * Hkv + kvh) * D;
+        device const float *vr = v_cache + ((uint64_t)row * Hkv + kvh) * D;
         float kv[4], vv[4];
         for (uint j = 0; j < 4u; j++) {
             const uint d = tiisg * 4u + j;
