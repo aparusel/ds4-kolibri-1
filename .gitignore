@@ -90,3 +90,4 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /tests/test_kolibri1_agent_chat
 /tests/test_kolibri1_server_render
+/tests/test_kolibri1_session

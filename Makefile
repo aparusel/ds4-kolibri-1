@@ -736,13 +736,17 @@ KOLIBRI1_TOKENIZER_DIR ?=
 KOLIBRI1_MINI_GGUF ?= gguf/Kolibri-1-mini.gguf
 
 .PHONY: test-kolibri1-gguf
-test-kolibri1-gguf: ds4
+test-kolibri1-gguf: ds4 tests/test_kolibri1_session
 	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
 		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
 	python3 tests/make_kolibri1_mini.py --tokenizer "$(KOLIBRI1_TOKENIZER_DIR)" \
 		--out "$(KOLIBRI1_MINI_GGUF)"
 	./ds4 -m "$(KOLIBRI1_MINI_GGUF)" --inspect
 	python3 tests/test_kolibri1_parity.py --gguf "$(KOLIBRI1_MINI_GGUF)"
+	tests/test_kolibri1_session --cpu "$(KOLIBRI1_MINI_GGUF)"
+ifeq ($(UNAME_S),Darwin)
+	tests/test_kolibri1_session "$(KOLIBRI1_MINI_GGUF)"
+endif
 
 .PHONY: test-kolibri1-torch
 test-kolibri1-torch: ds4
@@ -772,6 +776,16 @@ ifeq ($(UNAME_S),Darwin)
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
 	$(DS4_LINK) -o $@ tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+endif
+
+tests/test_kolibri1_session.o: tests/test_kolibri1_session.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_kolibri1_session: tests/test_kolibri1_session.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
