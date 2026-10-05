@@ -272,7 +272,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 ## Detailed Guides
 
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
+- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, Kolibri-1, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
