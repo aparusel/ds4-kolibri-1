@@ -43910,7 +43910,9 @@ const char *ds4_kolibri_reasoning_effort_text(ds4_think_mode mode) {
     case DS4_THINK_MAX:     return DS4_KOLIBRI_REASONING_HIGH;
     }
     const int level = ds4_think_mode_level(mode);
-    if (level <= 0 || level > 100) return DS4_KOLIBRI_REASONING_HIGH;
+    /* Numeric level 0 is the flag spelling of --nothink. */
+    if (level == 0) return DS4_KOLIBRI_REASONING_DISABLED;
+    if (level < 0 || level > 100) return DS4_KOLIBRI_REASONING_HIGH;
     if (level <= 33) return DS4_KOLIBRI_REASONING_LOW;
     if (level <= 66) return DS4_KOLIBRI_REASONING_MEDIUM;
     return DS4_KOLIBRI_REASONING_HIGH;
