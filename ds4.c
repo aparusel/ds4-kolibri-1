@@ -80515,6 +80515,11 @@ static bool ds4_sessions_eval_batch_metal_supported(
     if (items[0].session && ds4_session_is_qwen4(items[0].session))
         return qwen4_graph_native_session_batch_supported(items, count, e);
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    /* The Kolibri graph has no cross-session batch encode: its rings and
+     * command stream are per session.  Decline so the caller serializes. */
+    if (items[0].session && ds4_session_is_kolibri1(items[0].session)) return false;
+#endif
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
         if (!s || s->engine != e || s->distributed ||
