@@ -357,6 +357,7 @@ typedef struct {
     size_t kolibri_key_len;
     bool kolibri_key_full;
     bool kolibri_have_name;
+    bool kolibri_args_complete; /* one-shot: arguments value just closed */
     char *kolibri_dec;          /* decoded bytes of the current JSON string */
     size_t kolibri_dec_len;
     size_t kolibri_dec_cap;
@@ -2306,6 +2307,7 @@ static void agent_kolibri_commit_string_value(agent_dsml_parser *p) {
                                           p->kolibri_dec ? p->kolibri_dec : "",
                                           p->kolibri_dec_len) != 0)
             return;
+        p->kolibri_args_complete = true;
     }
     /* Unknown top-level members are discarded. */
     agent_kolibri_dec_reset(p);
@@ -2319,6 +2321,7 @@ static void agent_kolibri_reset_call_state(agent_dsml_parser *p) {
     p->kolibri_key_len = 0;
     p->kolibri_key_full = false;
     p->kolibri_have_name = false;
+    p->kolibri_args_complete = false;
     p->kolibri_nested_depth = 0;
     p->kolibri_nested_str = p->kolibri_nested_esc = false;
     agent_kolibri_dec_reset(p);
@@ -2382,6 +2385,7 @@ static void agent_kolibri_tool_parse(agent_dsml_parser *p) {
                 if (p->kolibri_frame == 1) {
                     /* Empty arguments object: back to the top level. */
                     p->kolibri_frame = 0;
+                    p->kolibri_args_complete = true;
                     p->kolibri_step = KOLIBRI_AFTER_VALUE;
                 } else {
                     p->kolibri_step = KOLIBRI_WANT_CLOSE;
@@ -2599,6 +2603,7 @@ static void agent_kolibri_tool_parse(agent_dsml_parser *p) {
                 p->parse_pos++;
                 if (p->kolibri_frame == 1) {
                     p->kolibri_frame = 0;
+                    p->kolibri_args_complete = true;
                     /* the top level continues after the arguments value */
                     p->kolibri_step = KOLIBRI_AFTER_VALUE;
                 } else {
@@ -4967,6 +4972,34 @@ static void agent_stream_tool_events(agent_stream_renderer *sr) {
         agent_tool_viz_param_begin(sr, p->param_name);
 }
 
+/* Record a failed edit old preflight: the caller stops the block and the model
+ * gets a retryable tool error instead of a full new-text generation. */
+static void agent_stream_preflight_fail(agent_stream_renderer *sr, const char *err) {
+    sr->tool_preflight_error = true;
+    snprintf(sr->tool_preflight_error_msg, sizeof(sr->tool_preflight_error_msg),
+             "edit old selector failed before new was generated: %s",
+             err[0] ? err : "old text is not a unique match");
+    agent_trace(sr->renderer->worker, "edit old preflight failed: %s",
+                sr->tool_preflight_error_msg);
+}
+
+/* Check the committed call directly.  This is the earliest point for models
+ * that wrap arguments in a JSON string or emit old before path; the param
+ * close path below catches the common path-then-old order even earlier. */
+static void agent_stream_preflight_edit_call(agent_stream_renderer *sr) {
+    if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
+        return;
+    agent_dsml_parser *p = sr->parser;
+    if (!p || !p->current.name || strcmp(p->current.name, "edit") != 0)
+        return;
+
+    char err[256] = {0};
+    if (agent_preflight_edit_old(sr->renderer->worker, &p->current,
+                                 err, sizeof(err)))
+        return;
+    agent_stream_preflight_fail(sr, err);
+}
+
 static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
     if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
         return;
@@ -4976,18 +5009,7 @@ static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
         return;
     if (!p->current.name || strcmp(p->current.name, "edit") != 0)
         return;
-
-    char err[256] = {0};
-    if (agent_preflight_edit_old(sr->renderer->worker, &p->current,
-                                 err, sizeof(err)))
-        return;
-
-    sr->tool_preflight_error = true;
-    snprintf(sr->tool_preflight_error_msg, sizeof(sr->tool_preflight_error_msg),
-             "edit old selector failed before new was generated: %s",
-             err[0] ? err : "old text is not a unique match");
-    agent_trace(sr->renderer->worker, "edit old preflight failed: %s",
-                sr->tool_preflight_error_msg);
+    agent_stream_preflight_edit_call(sr);
 }
 
 static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
@@ -5001,6 +5023,12 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
         {
             agent_stream_preflight_closed_param(sr);
             agent_tool_viz_param_end(sr);
+        }
+        if (sr->parser->syntax == AGENT_TOOL_SYNTAX_KOLIBRI &&
+            sr->parser->kolibri_args_complete)
+        {
+            sr->parser->kolibri_args_complete = false;
+            agent_stream_preflight_edit_call(sr);
         }
     }
     if (sr->parser->state == AGENT_DSML_DONE) {
@@ -9073,6 +9101,100 @@ static void test_agent_kolibri_stream_tool_call_chunked(void) {
     agent_dsml_parser_free(&p);
 }
 
+/* The edit old selector must be preflighted the moment the old string closes:
+ * generation can then stop before the model spends tokens on new text.  A
+ * matching old stays silent, a missing one sets the early-stop error.  The
+ * same check must fire at the earliest point the committed call allows when
+ * the model wraps arguments in a JSON string or emits old before path. */
+static void test_agent_kolibri_stream_edit_old_preflight(void) {
+    char path[] = "/tmp/ds4-kolibri-preflight-XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char body[] = "alpha\nbeta\ngamma\n";
+    AGENT_TEST_ASSERT(write(fd, body, sizeof(body) - 1) ==
+                      (ssize_t)(sizeof(body) - 1));
+    close(fd);
+
+    char head_path_old[512], head_old_first[512], head_str_args[512];
+    snprintf(head_path_old, sizeof(head_path_old),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "{\"path\": \"%s\", \"old\": \"beta\"", path);
+    snprintf(head_old_first, sizeof(head_old_first),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "{\"old\": \"zzz-missing\"");
+    snprintf(head_str_args, sizeof(head_str_args),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "\"{\\\"path\\\": \\\"%s\\\", \\\"old\\\": \\\"zzz-missing\\\"}\"", path);
+
+    const char *match[] = {
+        head_path_old, ", \"new\": \"B\"}}\n</tool_call>",
+    };
+    const char *old_first[] = {
+        head_old_first, ", \"path\": \"", path, "\"}}", "\n</tool_call>",
+    };
+    const char *str_args[] = {
+        head_str_args, "}\n</tool_call>",
+    };
+    char missing_head[512];
+    snprintf(missing_head, sizeof(missing_head),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "{\"path\": \"%s\", \"old\": \"zzz-missing\"", path);
+    const char *missing[] = {
+        missing_head, ", \"new\": \"B\"}}\n</tool_call>",
+    };
+
+    struct {
+        const char **chunks;
+        size_t count;
+        size_t check_after; /* 1-based chunk index to inspect the flag at */
+        bool expect_error;
+    } cases[] = {
+        { match, 2, 1, false },
+        { missing, 2, 1, true },
+        { old_first, 5, 4, true },
+        { str_args, 2, 1, true },
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        agent_tail_capture out = { .cap = 4096 };
+        agent_token_renderer renderer = {
+            .format_thinking = true,
+            .format_markdown = false,
+            .last_output_newline = true,
+            .capture = &out,
+        };
+        agent_dsml_parser p = {
+            .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+            .state = AGENT_DSML_SEARCH,
+        };
+        agent_stream_renderer stream = {
+            .renderer = &renderer,
+            .parser = &p,
+            .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        };
+
+        bool early = false;
+        for (size_t i = 0; i < cases[c].count; i++) {
+            agent_stream_text(&stream, cases[c].chunks[i],
+                              strlen(cases[c].chunks[i]), false);
+            if (i + 1 == cases[c].check_after) early = stream.tool_preflight_error;
+        }
+        agent_stream_text(&stream, NULL, 0, true);
+        if (early != cases[c].expect_error)
+            fprintf(stderr, "edit preflight case %zu: early=%d want=%d\n",
+                    c, (int)early, (int)cases[c].expect_error);
+        AGENT_TEST_ASSERT(early == cases[c].expect_error);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 1 &&
+                          !strcmp(agent_tool_arg_value(&p.calls.v[0], "old"),
+                                  c == 0 ? "beta" : "zzz-missing"));
+        agent_dsml_parser_free(&p);
+        char *captured = agent_tail_capture_take(&out, NULL);
+        free(captured);
+    }
+    unlink(path);
+}
+
 static void test_agent_kolibri_stream_ignores_tool_inside_think(void) {
     const char *inside[] = {
         "<think>plan</think>\n<tool_call>\n{\"name\": \"list\", "
@@ -9150,6 +9272,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_kolibri_tool_parser_two_calls_and_string_args();
     test_agent_kolibri_tool_parser_errors();
     test_agent_kolibri_stream_tool_call_chunked();
+    test_agent_kolibri_stream_edit_old_preflight();
     test_agent_kolibri_stream_ignores_tool_inside_think();
     test_agent_kolibri_tools_prompt();
     test_agent_glm_stream_ignores_tool_inside_think();
