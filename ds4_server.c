@@ -1299,6 +1299,18 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = DS4_THINK_HIGH;
 }
 
+/* Model-level sampling defaults for request knobs the client left unset.
+ * Mirrors cli_apply_model_sampling_defaults so an OpenAI request that sets
+ * nothing samples like the CLI.  Explicit client values always win. */
+static void request_apply_model_sampling_defaults(ds4_engine *e, request *r) {
+    if (!e || !r || !ds4_engine_is_kolibri1(e)) return;
+    /* released sampling defaults: temp 1.0, top_p 0.97, top_k 128, min_p 0 */
+    if (!r->temperature_set) r->temperature = 1.0f;
+    if (!r->top_p_set) r->top_p = 0.97f;
+    if (!r->top_k_set) r->top_k = 128;
+    if (!r->min_p_set) r->min_p = 0.0f;
+}
+
 static bool parse_ignore_eos_value(const char **p, request *r) {
     return p && r && json_bool(p, &r->ignore_eos);
 }
@@ -4862,6 +4874,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -5078,6 +5091,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -6107,6 +6121,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -6313,6 +6328,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -14855,11 +14871,14 @@ decode_again:
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
+        if (ds4_think_mode_enabled(j->req.think_mode) &&
+            !ds4_engine_is_kolibri1(s->engine)) {
             /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
              * only for knobs the client left out: an explicit request value
              * (e.g. temperature 0 from a benchmark harness) must win, or the
-             * same greedy request returns different text on every call. */
+             * same greedy request returns different text on every call.
+             * Kolibri-1 uses its own released defaults, already resolved by
+             * request_apply_model_sampling_defaults. */
             if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
             if (!j->req.top_k_set) top_k = 0;
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
@@ -16800,10 +16819,6 @@ int main(int argc, char **argv) {
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
-    }
-    if (ds4_engine_is_kolibri1(engine)) {
-        fprintf(stderr, "ds4-server: Kolibri-1 chat is not wired into the server yet; use the CLI\n");
-        return 2;
     }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
