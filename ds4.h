@@ -308,6 +308,9 @@ int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
+bool ds4_engine_is_kolibri1(ds4_engine *e);
+void ds4_chat_append_system_effort(ds4_engine *e, ds4_tokens *tokens,
+                                   const char *system, ds4_think_mode think_mode);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);

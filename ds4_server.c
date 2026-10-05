@@ -15883,6 +15883,10 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    if (ds4_engine_is_kolibri1(engine)) {
+        fprintf(stderr, "ds4-server: Kolibri-1 chat is not wired into the server yet; use the CLI\n");
+        return 2;
+    }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {

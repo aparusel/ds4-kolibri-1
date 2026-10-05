@@ -748,6 +748,12 @@ test-kolibri1-gguf: ds4
 test-kolibri1-torch: ds4
 	python3 tests/test_kolibri1_torch.py --gguf "$(KOLIBRI1_MINI_GGUF)"
 
+.PHONY: test-kolibri1-chat
+test-kolibri1-chat: ds4
+	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
+		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
+	python3 tests/test_kolibri1_chat.py
+
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 

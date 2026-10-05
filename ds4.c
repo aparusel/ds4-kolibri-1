@@ -43796,6 +43796,10 @@ const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
+    if (ds4_model_is_kolibri1()) {
+        /* the effort sentence renders inside the system block */
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
@@ -43861,12 +43865,111 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* Kolibri-1 chat rendering (released template).  Every prompt opens with a
+ * system block that always carries the "# Reasoning effort" sentence for the
+ * requested level; turns are <|im_start|>role\n…<|im_end|> with plain-text
+ * role names (the im / tool / think markers are added tokens, no role ids);
+ * consecutive tool results share one user turn wrapped in tool-response
+ * tags; thinking-enabled generation ends after "assistant\n" and the model
+ * opens its own think block, while disabled thinking force-closes an empty
+ * think block. */
+static const char *DS4_KOLIBRI_REASONING_DISABLED =
+    "Reasoning is disabled. Proceed straight to answering according "
+    "to the user's instructions.";
+static const char *DS4_KOLIBRI_REASONING_LOW =
+    "Reasoning effort is set to low. Think briefly through only the "
+    "essential steps in the user's language, then proceed directly "
+    "to the answer.";
+static const char *DS4_KOLIBRI_REASONING_MEDIUM =
+    "Reasoning effort is set to medium. Think through the task "
+    "methodically in the user's language, check key assumptions, and "
+    "provide a well-supported answer.";
+static const char *DS4_KOLIBRI_REASONING_HIGH =
+    "Reasoning effort is set to high. Think carefully through the task in "
+    "the user's language, validate key assumptions, consider plausible "
+    "alternatives, and prioritize correctness and clarity.";
+
+const char *ds4_kolibri_reasoning_effort_text(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE:    return DS4_KOLIBRI_REASONING_DISABLED;
+    case DS4_THINK_LOW:     return DS4_KOLIBRI_REASONING_LOW;
+    case DS4_THINK_MEDIUM:  return DS4_KOLIBRI_REASONING_MEDIUM;
+    case DS4_THINK_HIGH:
+    case DS4_THINK_MAX:     return DS4_KOLIBRI_REASONING_HIGH;
+    }
+    const int level = ds4_think_mode_level(mode);
+    if (level <= 0 || level > 100) return DS4_KOLIBRI_REASONING_HIGH;
+    if (level <= 33) return DS4_KOLIBRI_REASONING_LOW;
+    if (level <= 66) return DS4_KOLIBRI_REASONING_MEDIUM;
+    return DS4_KOLIBRI_REASONING_HIGH;
+}
+
+static void kolibri_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    char *role_line = xmalloc(strlen(role) + 2);
+    sprintf(role_line, "%s\n", role);
+    bpe_tokenize_text(vocab, role_line, out);
+    free(role_line);
+}
+
+static void kolibri_chat_close(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->im_end_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void kolibri_chat_system(const ds4_vocab *vocab, const char *system,
+                                ds4_think_mode think_mode, token_vec *out) {
+    const char *effort = ds4_kolibri_reasoning_effort_text(think_mode);
+    const bool have_system = system && system[0];
+    kolibri_chat_open(vocab, "system", out);
+    if (have_system) bpe_tokenize_text(vocab, system, out);
+    if (effort) {
+        if (have_system) bpe_tokenize_text(vocab, "\n\n", out);
+        bpe_tokenize_text(vocab, "# Reasoning effort\n\n", out);
+        bpe_tokenize_text(vocab, effort, out);
+    }
+    kolibri_chat_close(vocab, out);
+}
+
+static void kolibri_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode think_mode,
+                                          token_vec *out) {
+    kolibri_chat_open(vocab, "assistant", out);
+    if (!ds4_think_mode_enabled(think_mode)) {
+        token_vec_push(out, vocab->think_start_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+        token_vec_push(out, vocab->think_end_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+    }
+}
+
+void ds4_chat_append_system_effort(ds4_engine *e, ds4_tokens *tokens, const char *system,
+                                   ds4_think_mode think_mode) {
+    /* Kolibri-1 folds the "# Reasoning effort" sentence into the first
+     * system block; the plain append path cannot know the think mode. */
+    if (ds4_model_is_kolibri1()) {
+        kolibri_chat_system(&e->vocab, system, think_mode, tokens);
+        return;
+    }
+    ds4_chat_append_message(e, tokens, "system", system);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_kolibri1()) {
+        if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+            ds4_die("this tokenizer does not provide the Kolibri chat markers; use raw prompt tokenization");
+        }
+        kolibri_chat_system(vocab, system, think_mode, out);
+        kolibri_chat_open(vocab, "user", out);
+        bpe_tokenize_text(vocab, prompt ? prompt : "", out);
+        kolibri_chat_close(vocab, out);
+        kolibri_chat_assistant_prefix(vocab, think_mode, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -43995,7 +44098,13 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
+/* Kolibri-1 tool results defer the user turn's <|im_end|> so consecutive
+ * results share one turn, as the released template renders them. The flag
+ * is per-thread like the other chat builders' scratch state. */
+static __thread bool kolibri_chat_tool_turn_open;
+
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+    if (ds4_model_is_kolibri1()) kolibri_chat_tool_turn_open = false;
     chat_push_bos_sequence(&e->vocab, tokens);
 }
 
@@ -44064,6 +44173,46 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (ds4_model_is_kolibri1()) {
+        /* Consecutive tool results share one user turn: the closing
+         * <|im_end|> is deferred until a non-tool message follows. */
+        if (kolibri_chat_tool_turn_open &&
+            strcmp(role, "tool") && strcmp(role, "function")) {
+            token_vec_push(tokens, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            kolibri_chat_tool_turn_open = false;
+        }
+        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            if (!kolibri_chat_tool_turn_open) {
+                token_vec_push(tokens, vocab->im_start_id);
+                bpe_tokenize_text(vocab, "user\n", tokens);
+                kolibri_chat_tool_turn_open = true;
+            } else {
+                bpe_tokenize_text(vocab, "\n", tokens);
+            }
+            token_vec_push(tokens, vocab->tool_response_start_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            bpe_tokenize_tool_response_text(vocab, content, tokens);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            token_vec_push(tokens, vocab->tool_response_end_id);
+            return;
+        }
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            kolibri_chat_open(vocab, "system", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+            kolibri_chat_close(vocab, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            kolibri_chat_open(vocab, "assistant", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            kolibri_chat_close(vocab, tokens);
+        } else {
+            kolibri_chat_open(vocab, "user", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+            kolibri_chat_close(vocab, tokens);
+        }
+        return;
+    }
+
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
@@ -44130,6 +44279,15 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_kolibri1()) {
+        if (kolibri_chat_tool_turn_open) {
+            token_vec_push(tokens, e->vocab.im_end_id);
+            bpe_tokenize_text(&e->vocab, "\n", tokens);
+            kolibri_chat_tool_turn_open = false;
+        }
+        kolibri_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -64614,8 +64772,9 @@ int ds4_dump_chat_tokenization(const char *model_path,
     model_open(&model, model_path, false, false);
     config_validate_model(&model);
     if (ds4_think_mode_level(think_mode) >= 0 &&
-        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        !ds4_model_is_kolibri1()) {
+        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 or Kolibri-1 model\n");
         model_close(&model);
         return 2;
     }
@@ -72847,6 +73006,11 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_is_kolibri1(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_kolibri1();
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */

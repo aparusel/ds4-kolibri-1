@@ -76,9 +76,11 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    int top_k;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_k_set;
     uint64_t seed;
     ds4_think_mode think_mode;
 } agent_generation_options;
@@ -857,6 +859,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
@@ -1006,7 +1011,15 @@ static agent_config parse_options(int argc, char **argv) {
 static void agent_apply_model_sampling_defaults(
         ds4_engine               *engine,
         agent_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
+    if (ds4_engine_is_kolibri1(engine)) {
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.97f;
+        if (!gen->top_k_set) gen->top_k = 128;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        return;
+    }
+    if (!ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -10270,7 +10283,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return ds4_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
-                              0,
+                              greedy ? 0 : cfg->gen.top_k,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
                               rng);
@@ -10500,7 +10513,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 ntok = ds4_session_eval_speculative(
                     w->session, token, max_tokens - generated,
                     ds4_token_eos(w->engine),
-                    greedy_sampling ? 0.0f : cfg->gen.temperature, 0,
+                    greedy_sampling ? 0.0f : cfg->gen.temperature, cfg->gen.top_k,
                     greedy_sampling ? 1.0f : cfg->gen.top_p,
                     greedy_sampling ? 0.0f : cfg->gen.min_p,
                     &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])),
@@ -10887,7 +10900,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
     while (generated < max_tokens && !worker_should_interrupt(w)) {
         int token = ds4_session_sample(w->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -10900,7 +10913,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative(
                 w->session, token, max_tokens - generated,
-                ds4_token_eos(w->engine), cfg->gen.temperature, 0,
+                ds4_token_eos(w->engine), cfg->gen.temperature, cfg->gen.top_k,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));

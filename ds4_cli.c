@@ -69,9 +69,11 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    int top_k;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_k_set;
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logits_path;
@@ -359,6 +361,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
 static bool is_rendered_chat_prompt(const char *prompt) {
     static const char *prefixes[] = {
+        "<|im_start|>",
         "<｜begin▁of▁sentence｜>",
         "<｜User｜>",
         "[gMASK]",
@@ -529,7 +532,16 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
+    if (ds4_engine_is_kolibri1(engine)) {
+        /* released sampling defaults: temp 1.0, top_p 0.97, top_k 128 */
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.97f;
+        if (!gen->top_k_set) gen->top_k = 128;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        return;
+    }
+    if (!ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -608,7 +620,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(session, cfg->gen.temperature, 0,
+            token = ds4_session_sample(session, cfg->gen.temperature, cfg->gen.top_k,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
@@ -620,7 +632,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
                 session, token, max_tokens - generated,
-                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                ds4_token_eos(engine), cfg->gen.temperature, cfg->gen.top_k,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
@@ -1449,7 +1461,8 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     chat->think_prefix_pos = chat->transcript.len;
     repl_chat_apply_think_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
     if (cfg->gen.system && cfg->gen.system[0]) {
-        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
+        ds4_chat_append_system_effort(engine, &chat->transcript, cfg->gen.system,
+                                      cli_effective_think_mode(&cfg->gen));
     }
     ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
     if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
@@ -1612,7 +1625,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         } else {
             token = ds4_session_sample(chat->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -1626,7 +1639,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
                 chat->session, token, max_tokens - generated,
-                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                ds4_token_eos(engine), cfg->gen.temperature, cfg->gen.top_k,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
@@ -2049,6 +2062,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
@@ -2339,8 +2355,9 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
-    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 &&
+        !ds4_engine_is_deepseek41(engine) && !ds4_engine_is_kolibri1(engine)) {
+        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 or Kolibri-1 model\n");
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);
         ds4_prompt_prefix_free(&cfg.gen.prefix);
