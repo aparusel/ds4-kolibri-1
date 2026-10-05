@@ -383,7 +383,9 @@ typedef struct {
     ds4_engine *engine;
     FILE *fp;
     bool format_thinking;
+    bool hide_tool_calls;
     bool in_think;
+    bool in_tool_call;
     bool color_open;
     bool use_color;
     bool last_output_newline;
@@ -421,9 +423,27 @@ static void token_printer_write_char(token_printer *p, char c) {
     p->last_output_newline = c == '\n';
 }
 
+/* A tool-call stanza in plain chat is wire format, not answer text.  Hide it
+ * behind a dim placeholder like the agent and server do; the model's prose
+ * before and after the stanza keeps printing normally. */
+static void token_printer_tool_call_note(token_printer *p) {
+    token_printer_reset_color(p);
+    if (!p->last_output_newline) {
+        fputc('\n', p->fp);
+        p->last_output_newline = true;
+    }
+    if (p->use_color) fputs("\x1b[90m", p->fp);
+    fputs("[tool call]", p->fp);
+    if (p->use_color) fputs("\x1b[0m", p->fp);
+    fputc('\n', p->fp);
+    p->last_output_newline = true;
+}
+
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
     const char *think_open = "<think>";
     const char *think_close = "</think>";
+    const char *call_open = "<tool_call>";
+    const char *call_close = "</tool_call>";
     size_t total = p->pending_len + len;
     char *buf = malloc(total ? total : 1);
     if (!buf) return;
@@ -435,12 +455,31 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
     while (i < total) {
         const char *cur = buf + i;
         const size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
+        /* Inside a call, drop the body; only the closing marker matters. */
+        if (p->in_tool_call) {
+            if (bytes_has_prefix(cur, rem, call_close)) {
+                p->in_tool_call = false;
+                i += strlen(call_close);
+                continue;
+            }
+            if (!finish && cur[0] == '<' &&
+                bytes_is_partial_prefix(cur, rem, call_close))
+            {
+                if (rem < sizeof(p->pending)) {
+                    memcpy(p->pending, cur, rem);
+                    p->pending_len = rem;
+                }
+                break;
+            }
+            i++;
+            continue;
+        }
+        if (p->format_thinking && bytes_has_prefix(cur, rem, think_open)) {
             p->in_think = true;
             i += strlen(think_open);
             continue;
         }
-        if (bytes_has_prefix(cur, rem, think_close)) {
+        if (p->format_thinking && bytes_has_prefix(cur, rem, think_close)) {
             p->in_think = false;
             token_printer_reset_color(p);
             if (!p->last_output_newline) {
@@ -450,9 +489,23 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
             i += strlen(think_close);
             continue;
         }
+        /* Tool calls are executable only outside thinking; inside thinking the
+         * marker is prose and stays visible with the rest of the trace. */
+        if (p->hide_tool_calls && !p->in_think &&
+            bytes_has_prefix(cur, rem, call_open))
+        {
+            p->in_tool_call = true;
+            token_printer_tool_call_note(p);
+            i += strlen(call_open);
+            continue;
+        }
         if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
+            ((p->format_thinking &&
+              (bytes_is_partial_prefix(cur, rem, think_open) ||
+               bytes_is_partial_prefix(cur, rem, think_close))) ||
+             (p->hide_tool_calls && !p->in_think &&
+              (bytes_is_partial_prefix(cur, rem, call_open) ||
+               bytes_is_partial_prefix(cur, rem, call_close)))))
         {
             if (rem < sizeof(p->pending)) {
                 memcpy(p->pending, cur, rem);
@@ -468,7 +521,7 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
 }
 
 static void token_printer_finish(token_printer *p) {
-    if (p->format_thinking) {
+    if (p->format_thinking || p->hide_tool_calls) {
         token_printer_process(p, NULL, 0, true);
         token_printer_reset_color(p);
     }
@@ -486,7 +539,7 @@ static void generation_done(void *ud) {
 }
 
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
-    if (p->format_thinking) {
+    if (p->format_thinking || p->hide_tool_calls) {
         token_printer_process(p, text, len, false);
     } else if (len) {
         fwrite(text, 1, len, p->fp);
@@ -568,6 +621,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         .engine = engine,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
+        .hide_tool_calls = !cfg->gen.raw_prompt,
         .in_think = ds4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
@@ -1264,6 +1318,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                 .engine = engine,
                 .fp = stdout,
                 .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+                .hide_tool_calls = !cfg->gen.raw_prompt,
                 .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
                 .use_color = isatty(fileno(stdout)) != 0,
                 .last_output_newline = true,
@@ -1595,6 +1650,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         .engine = engine,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
+        .hide_tool_calls = true,
         .in_think = ds4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
