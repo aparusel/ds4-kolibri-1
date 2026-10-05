@@ -66014,6 +66014,77 @@ static int ds4_session_eval_splitkv_spec_after_first(
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+/* Greedy generation through a session.  Sessions drive the family-appropriate
+ * backend, and they are the only working Kolibri-1 CPU path: the raw-wa
+ * helpers below are DeepSeek layer-major code.  Kept outside the GPU guard so
+ * CPU-only builds can use it too. */
+static int generate_session_argmax(
+        ds4_engine        *e,
+        const ds4_tokens  *prompt,
+        int                n_predict,
+        int                ctx_size,
+        ds4_token_emit_fn  emit,
+        ds4_generation_done_fn done,
+        void              *emit_ud,
+        ds4_session_progress_fn progress,
+        void              *progress_ud) {
+    ds4_session *s = NULL;
+    char err[256] = {0};
+    const double t_prefill0 = now_sec();
+    if (ds4_session_create(&s, e, ctx_size) != 0) {
+        fprintf(stderr, "ds4: failed to create the generation session\n");
+        return 1;
+    }
+    ds4_session_set_progress(s, progress, progress_ud);
+    if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(s, NULL, NULL);
+        fprintf(stderr, "ds4: session prefill failed: %s\n", err);
+        ds4_session_free(s);
+        return 1;
+    }
+    ds4_session_set_progress(s, NULL, NULL);
+    const double t_prefill1 = now_sec();
+
+    int rc = 0;
+    int n_generated = 0;
+    const double t_decode0 = now_sec();
+    const char *greedy_env = getenv("DS4_CUDA_GREEDY_TOP1");
+    const bool greedy_top1 = !greedy_env || !greedy_env[0] || strcmp(greedy_env, "0") != 0;
+    int token = ds4_session_argmax(s);
+    for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
+        if (token < 0) {
+            fprintf(stderr, "ds4: session argmax failed\n");
+            rc = 1;
+            break;
+        }
+        if (ds4_token_is_stop(e, token)) break;
+        if (emit) emit(emit_ud, token);
+        n_generated++;
+        if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
+        if (greedy_top1) {
+            token = ds4_session_eval_argmax(s, token, err, sizeof(err));
+        } else if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
+            token = ds4_session_argmax(s);
+        } else {
+            token = -1;
+        }
+        if (token < 0) {
+            fprintf(stderr, "ds4: session decode failed: %s\n", err);
+            rc = 1;
+            break;
+        }
+    }
+    const double t_decode1 = now_sec();
+    if (done) done(emit_ud);
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
+            (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
+    ds4_session_free(s);
+    return rc;
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -66037,60 +66108,8 @@ int ds4_engine_generate_argmax(
         }
         if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1) {
-            ds4_session *s = NULL;
-            char err[256] = {0};
-            const double t_prefill0 = now_sec();
-            if (ds4_session_create(&s, e, ctx_size) != 0) {
-                fprintf(stderr, "ds4: failed to create multi-tier graph session\n");
-                return 1;
-            }
-            ds4_session_set_progress(s, progress, progress_ud);
-            if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
-                ds4_session_set_progress(s, NULL, NULL);
-                fprintf(stderr, "ds4: multi-tier prefill failed: %s\n", err);
-                ds4_session_free(s);
-                return 1;
-            }
-            ds4_session_set_progress(s, NULL, NULL);
-            const double t_prefill1 = now_sec();
-
-            int rc = 0;
-            int n_generated = 0;
-            const double t_decode0 = now_sec();
-            const bool greedy_top1 = metal_graph_tp_env_flag("DS4_CUDA_GREEDY_TOP1", true);
-            int token = ds4_session_argmax(s);
-            for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
-                if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier argmax failed\n");
-                    rc = 1;
-                    break;
-                }
-                if (ds4_token_is_stop(e, token)) break;
-                if (emit) emit(emit_ud, token);
-                n_generated++;
-                if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
-                if (greedy_top1) {
-                    token = ds4_session_eval_argmax(s, token, err, sizeof(err));
-                } else if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
-                    token = ds4_session_argmax(s);
-                } else {
-                    token = -1;
-                }
-                if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier decode failed: %s\n", err);
-                    rc = 1;
-                    break;
-                }
-            }
-            const double t_decode1 = now_sec();
-            if (done) done(emit_ud);
-            ds4_log(stderr,
-                    DS4_LOG_TIMING,
-                    "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-                    (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
-                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
-            ds4_session_free(s);
-            return rc;
+            return generate_session_argmax(e, prompt, n_predict, ctx_size,
+                                           emit, done, emit_ud, progress, progress_ud);
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
@@ -66111,6 +66130,14 @@ int ds4_engine_generate_argmax(
                 ds4_backend_name(e->backend));
         return 1;
 #endif
+    }
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1) {
+        /* The raw-wa CPU path is DeepSeek layer-major code; route Kolibri-1
+         * through a session, whose prefill and decode call the Kolibri CPU
+         * reference forward. */
+        return generate_session_argmax(e, prompt, n_predict, ctx_size,
+                                       emit, done, emit_ud, progress, progress_ud);
     }
 
     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
