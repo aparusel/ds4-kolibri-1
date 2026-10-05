@@ -59932,6 +59932,16 @@ static bool kolibri1_graph_dense_ok(const ds4_tensor *t) {
                  t->type == DS4_TENSOR_F32 || t->type == DS4_TENSOR_BF16);
 }
 
+/* The routed experts run through the shared qwen4 MoE kernels, so they accept
+ * the same expert types as the Qwen graph (and the same 256-wide block
+ * constraint for the K-quants). */
+static bool kolibri1_graph_expert_ok(const ds4_tensor *t) {
+    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
+                 t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
+                 ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
+                  (t->dim[0] % 256u) == 0));
+}
+
 static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
     if (!kolibri1_graph_dense_ok(w->token_embd) || !kolibri1_graph_dense_ok(w->output)) {
         fprintf(stderr, "ds4: Kolibri-1 GPU graph needs Q8_0/F16/BF16/F32 embedding and output weights\n");
@@ -59950,9 +59960,9 @@ static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
                 return false;
             }
         }
-        if (!kolibri1_graph_dense_ok(l->ffn_gate_exps) ||
+        if (!kolibri1_graph_expert_ok(l->ffn_gate_exps) ||
             l->ffn_up_exps->type != l->ffn_gate_exps->type ||
-            !kolibri1_graph_dense_ok(l->ffn_down_exps)) {
+            !kolibri1_graph_expert_ok(l->ffn_down_exps)) {
             fprintf(stderr, "ds4: Kolibri-1 GPU graph: unsupported routed-expert weight types in layer %u\n", il);
             return false;
         }
