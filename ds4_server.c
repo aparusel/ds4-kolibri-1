@@ -657,6 +657,309 @@ static bool json_content_replace(const char **p, char **dst) {
     return true;
 }
 
+/* ==== Jinja2 tojson-fidelity serialization ====
+ *
+ * The Kolibri-1 template renders tool schemas and re-serializes assistant
+ * tool_calls arguments with jinja2's `tojson` filter (§12.4 item 1): keys
+ * sorted recursively, ", " / ": " separators, ensure_ascii unicode escapes,
+ * plus the htmlsafe filter's \u003c/\u003e/\u0026/\u0027 replacements. The
+ * functions below re-emit a parsed JSON value in exactly that spelling, so
+ * server-rendered Kolibri prompts byte-match the released template.
+ *
+ * Floats follow Python repr() rules (json.dumps passes floats to repr):
+ * shortest round-trip digits, fixed notation for decimal exponents in
+ * [-4, 16), otherwise `d.dddde±XX` with at least two exponent digits, and a
+ * bare ".0" suffix on integral values in fixed notation. Integers pass
+ * through verbatim (Python ints re-emit as their decimal digits).
+ * Object keys compare as UTF-8 bytes, which equals code-point order. */
+
+static void json_tojson_escape_string(buf *b, const char *s, size_t len) {
+    buf_putc(b, '"');
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  buf_puts(b, "\\\""); break;
+        case '\\': buf_puts(b, "\\\\"); break;
+        case '\n': buf_puts(b, "\\n"); break;
+        case '\r': buf_puts(b, "\\r"); break;
+        case '\t': buf_puts(b, "\\t"); break;
+        case '\b': buf_puts(b, "\\b"); break;
+        case '\f': buf_puts(b, "\\f"); break;
+        case '<':  buf_puts(b, "\\u003c"); break;
+        case '>':  buf_puts(b, "\\u003e"); break;
+        case '&':  buf_puts(b, "\\u0026"); break;
+        case '\'': buf_puts(b, "\\u0027"); break;
+        default:
+            if (c < 0x20) {
+                char esc[8];
+                snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                buf_puts(b, esc);
+            } else if (c < 0x80) {
+                buf_putc(b, (char)c);
+            } else {
+                /* Decode one UTF-8 sequence and re-emit as \uXXXX escapes
+                 * (ensure_ascii). Invalid bytes fall back to U+FFFD, like
+                 * the decoder's lone-surrogate handling. */
+                uint32_t cp = 0xfffd;
+                int n = 0;
+                if ((c & 0xe0) == 0xc0 && i + 1 < len &&
+                    (s[i + 1] & 0xc0) == 0x80) {
+                    cp = ((c & 0x1fu) << 6) | (s[i + 1] & 0x3fu);
+                    n = 1;
+                } else if ((c & 0xf0) == 0xe0 && i + 2 < len &&
+                           (s[i + 1] & 0xc0) == 0x80 &&
+                           (s[i + 2] & 0xc0) == 0x80) {
+                    cp = ((c & 0x0fu) << 12) | ((s[i + 1] & 0x3fu) << 6) |
+                         (s[i + 2] & 0x3fu);
+                    n = 2;
+                } else if ((c & 0xf8) == 0xf0 && i + 3 < len &&
+                           (s[i + 1] & 0xc0) == 0x80 &&
+                           (s[i + 2] & 0xc0) == 0x80 &&
+                           (s[i + 3] & 0xc0) == 0x80) {
+                    cp = ((c & 0x07u) << 18) | ((s[i + 1] & 0x3fu) << 12) |
+                         ((s[i + 2] & 0x3fu) << 6) | (s[i + 3] & 0x3fu);
+                    n = 3;
+                }
+                if (cp > 0xffff) {
+                    cp -= 0x10000u;
+                    char esc[16];
+                    snprintf(esc, sizeof(esc), "\\u%04x\\u%04x",
+                             0xd800u + (cp >> 10), 0xdc00u + (cp & 0x3ffu));
+                    buf_puts(b, esc);
+                } else {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)cp);
+                    buf_puts(b, esc);
+                }
+                i += (size_t)n;
+            }
+        }
+    }
+    buf_putc(b, '"');
+}
+
+/* Shortest round-trip digits for a double: the smallest precision in
+ * 1..17 whose %e form parses back to the exact same double, formatted per
+ * Python repr() rules (see the block comment above). */
+static void json_tojson_number(buf *b, double v) {
+    char digits[32];
+    int exp10 = 0;
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(digits, sizeof(digits), "%.*e", prec - 1, v);
+        if (strtod(digits, NULL) == v) break;
+    }
+    /* digits is "d.dddde±XX" (or "-d.dddde±XX"); pull out mantissa and
+     * decimal exponent. */
+    char mant[32];
+    const char *e = strchr(digits, 'e');
+    size_t mant_len = e ? (size_t)(e - digits) : strlen(digits);
+    snprintf(mant, sizeof(mant), "%.*s", (int)mant_len, digits);
+    exp10 = e ? atoi(e + 1) : 0;
+    /* Strip the sign from the mantissa; track it separately. */
+    bool neg = false;
+    if (mant[0] == '-') {
+        neg = true;
+        memmove(mant, mant + 1, strlen(mant));
+    }
+    /* mant is "d.ddd" (precision 1 gives "d"); drop the '.' so digits are
+     * contiguous. */
+    char num[32];
+    size_t num_len = 0;
+    for (const char *m = mant; *m; m++) {
+        if (*m != '.') num[num_len++] = *m;
+    }
+    num[num_len] = '\0';
+
+    buf out = {0};
+    if (neg) buf_putc(&out, '-');
+    if (exp10 >= -4 && exp10 < 16) {
+        /* Fixed notation. */
+        if (exp10 < 0) {
+            buf_puts(&out, "0.");
+            for (int i = 0; i < -exp10 - 1; i++) buf_putc(&out, '0');
+            buf_puts(&out, num);
+        } else {
+            size_t point = (size_t)exp10 + 1; /* digits before the point */
+            if (num_len < point) {
+                /* All digits land before the point: integral value. */
+                buf_puts(&out, num);
+                for (size_t i = num_len; i < point; i++) buf_putc(&out, '0');
+                buf_puts(&out, ".0");
+            } else if (num_len == point) {
+                buf_append(&out, num, point);
+                buf_puts(&out, ".0");
+            } else {
+                buf_append(&out, num, point);
+                buf_putc(&out, '.');
+                buf_puts(&out, num + point);
+            }
+        }
+    } else {
+        /* Scientific notation: d[.ddd]e±XX, at least two exponent digits. */
+        buf_putc(&out, num[0]);
+        if (num_len > 1) {
+            buf_putc(&out, '.');
+            buf_puts(&out, num + 1);
+        }
+        char exps[16];
+        snprintf(exps, sizeof(exps), "e%+03d", exp10);
+        buf_puts(&out, exps);
+    }
+    buf_puts(b, out.ptr ? out.ptr : "0");
+    buf_free(&out);
+}
+
+typedef struct {
+    char *key;
+    char *raw;
+} json_tojson_member;
+
+static int json_tojson_member_cmp(const void *a, const void *b) {
+    const json_tojson_member *ma = a, *mb = b;
+    return strcmp(ma->key, mb->key);
+}
+
+static bool json_tojson_sorted_value(const char **p, buf *b, int depth);
+
+static bool json_tojson_sorted_object(const char **p, buf *b, int depth) {
+    (*p)++; /* '{' */
+    json_tojson_member *members = NULL;
+    int len = 0, cap = 0;
+    bool ok = true;
+    json_ws(p);
+    if (**p != '}') {
+        while (**p && **p != '}') {
+            char *key = NULL, *raw = NULL;
+            if (!json_string(p, &key)) {
+                ok = false;
+                goto done;
+            }
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                ok = false;
+                goto done;
+            }
+            (*p)++;
+            if (!json_raw_value(p, &raw)) {
+                free(key);
+                ok = false;
+                goto done;
+            }
+            if (len == cap) {
+                cap = cap ? cap * 2 : 8;
+                members = xrealloc(members, (size_t)cap * sizeof(*members));
+            }
+            members[len++] = (json_tojson_member){key, raw};
+            json_ws(p);
+            if (**p == ',') {
+                (*p)++;
+                json_ws(p);
+            }
+        }
+    }
+    if (**p != '}') ok = false;
+    if (ok) (*p)++; /* '}' */
+    if (!ok) goto done;
+    qsort(members, (size_t)len, sizeof(*members), json_tojson_member_cmp);
+    buf_putc(b, '{');
+    for (int i = 0; i < len; i++) {
+        if (ok) {
+            if (i) buf_puts(b, ", ");
+            json_tojson_escape_string(b, members[i].key, strlen(members[i].key));
+            buf_puts(b, ": ");
+            const char *vp = members[i].raw;
+            if (!json_tojson_sorted_value(&vp, b, depth + 1)) ok = false;
+        }
+        free(members[i].key);
+        free(members[i].raw);
+    }
+    if (ok) buf_putc(b, '}');
+done:
+    free(members);
+    return ok;
+}
+
+static bool json_tojson_sorted_array(const char **p, buf *b, int depth) {
+    (*p)++; /* '[' */
+    buf_putc(b, '[');
+    json_ws(p);
+    int index = 0;
+    while (**p && **p != ']') {
+        if (index++) buf_puts(b, ", ");
+        if (!json_tojson_sorted_value(p, b, depth + 1)) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    buf_putc(b, ']');
+    return true;
+}
+
+static bool json_tojson_sorted_value(const char **p, buf *b, int depth) {
+    if (depth > 64) return false;
+    json_ws(p);
+    if (json_lit(p, "null")) { buf_puts(b, "null"); return true; }
+    if (json_lit(p, "true")) { buf_puts(b, "true"); return true; }
+    if (json_lit(p, "false")) { buf_puts(b, "false"); return true; }
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        json_tojson_escape_string(b, s, strlen(s));
+        free(s);
+        return true;
+    }
+    if (**p == '[') return json_tojson_sorted_array(p, b, depth);
+    if (**p == '{') return json_tojson_sorted_object(p, b, depth);
+    /* Number: integers pass through as digits; anything with a fraction or
+     * exponent re-renders through Python repr() rules. */
+    const char *start = *p;
+    if (!json_skip_value(p)) return false;
+    size_t n = (size_t)(*p - start);
+    bool integral = true;
+    for (size_t i = 0; i < n; i++) {
+        if (start[i] == '.' || start[i] == 'e' || start[i] == 'E') {
+            integral = false;
+            break;
+        }
+    }
+    if (integral) {
+        /* Normalize through strtoll so Python-int spellings match ("-0" →
+         * "0"); oversized digit strings pass through, since re-emitting a
+         * big decimal integer changes nothing. */
+        errno = 0;
+        char *end = NULL;
+        long long iv = strtoll(start, &end, 10);
+        if (end == start + (ptrdiff_t)n && errno != ERANGE) {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", iv);
+            buf_puts(b, tmp);
+        } else {
+            buf_append(b, start, n);
+        }
+    } else {
+        char *span = xstrndup(start, n);
+        json_tojson_number(b, strtod(span, NULL));
+        free(span);
+    }
+    return true;
+}
+
+/* Re-emit one raw JSON value in jinja2 `tool | tojson` spelling. The value
+ * must be a complete JSON value at *json; trailing content is ignored.
+ * Returns a malloc'd string, or NULL on malformed input. */
+static DS4_SERVER_MAYBE_UNUSED char *json_tojson_sorted(const char *json) {
+    const char *p = json ? json : "";
+    buf b = {0};
+    if (!json_tojson_sorted_value(&p, &b, 0)) {
+        buf_free(&b);
+        return NULL;
+    }
+    return buf_take(&b);
+}
+
 typedef enum {
     REQ_CHAT,
     REQ_COMPLETION,
@@ -20989,6 +21292,62 @@ static void append_tool_heavy_messages(buf *b) {
     buf_putc(b, ']');
 }
 
+static void test_json_tojson_sorted(void) {
+    /* Expected spellings were rendered with the same
+     * ImmutableSandboxedEnvironment the Kolibri parity gate uses
+     * (tests/test_kolibri1_chat.py); see §12.4 item 1. */
+    struct {
+        const char *in;
+        const char *out;
+    } cases[] = {
+        /* Recursive key sort, ", " / ": " separators, htmlsafe escapes. */
+        {"{\"strict\":true,\"name\":\"get\",\"description\":\"a<b>&c'd\","
+         "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":"
+         "{\"type\":\"string\",\"default\":\"x<y\"},\"n\":{\"type\":\"integer\"}}}}",
+         "{\"description\": \"a\\u003cb\\u003e\\u0026c\\u0027d\", \"name\": \"get\", "
+         "\"parameters\": {\"properties\": {\"n\": {\"type\": \"integer\"}, "
+         "\"path\": {\"default\": \"x\\u003cy\", \"type\": \"string\"}}, "
+         "\"type\": \"object\"}, \"strict\": true}"},
+        /* "-0" normalizes like a Python int; oversized ints pass through. */
+        {"{\"a\":-0,\"b\":1,\"c\":-1,\"big\":18446744073709551616}",
+         "{\"a\": 0, \"b\": 1, \"big\": 18446744073709551616, \"c\": -1}"},
+        /* Floats re-render through Python repr rules. */
+        {"{\"f1\":0.1,\"f2\":100000.0,\"f3\":1.0,\"f4\":1e16,\"f5\":1e15,"
+         "\"f6\":1.23e-08,\"f7\":0.0001,\"f8\":-2.5}",
+         "{\"f1\": 0.1, \"f2\": 100000.0, \"f3\": 1.0, \"f4\": 1e+16, "
+         "\"f5\": 1000000000000000.0, \"f6\": 1.23e-08, \"f7\": 0.0001, "
+         "\"f8\": -2.5}"},
+        /* String escapes: standard JSON plus control chars and non-ASCII. */
+        {"{\"s\":\"tab\there\\\"q\\\\\",\"ctl\":\"\\u0001\",\"u\":\"h\\u00e9llo\\u4e2d\"}",
+         "{\"ctl\": \"\\u0001\", \"s\": \"tab\\there\\\"q\\\\\", "
+         "\"u\": \"h\\u00e9llo\\u4e2d\"}"},
+        /* Nested containers, literals, empty containers. */
+        {"{\"nested\":{\"b\":[1,{\"y\":[true,false,null]},\"x\"],\"a\":{\"z\":1.5}}}",
+         "{\"nested\": {\"a\": {\"z\": 1.5}, \"b\": [1, {\"y\": [true, false, null]}, \"x\"]}}"},
+        {"[]", "[]"},
+        {"{}", "{}"},
+        /* Source key order must not survive. */
+        {"{\"z\":1,\"a\":2}", "{\"a\": 2, \"z\": 1}"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *out = json_tojson_sorted(cases[i].in);
+        TEST_ASSERT(out != NULL);
+        if (out) {
+            if (strcmp(out, cases[i].out) != 0) {
+                fprintf(stderr, "ds4-server: tojson case %zu mismatch\n"
+                                "  in:  %s\n  got: %s\n  want:%s\n",
+                        i, cases[i].in, out, cases[i].out);
+            }
+            TEST_ASSERT(!strcmp(out, cases[i].out));
+            free(out);
+        }
+    }
+    /* Malformed values produce NULL, not partial output. */
+    TEST_ASSERT(json_tojson_sorted("{\"a\":}") == NULL);
+    TEST_ASSERT(json_tojson_sorted("[1,") == NULL);
+    TEST_ASSERT(json_tojson_sorted("{\"a\" 1}") == NULL);
+}
+
 static void test_json_parser_handles_tool_heavy_requests(void) {
     buf tools = {0};
     buf_putc(&tools, '[');
@@ -23054,6 +23413,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_request_parsers_reject_malformed_duplicate_owned_fields();
+    test_json_tojson_sorted();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_json_int_handles_non_finite_values();
