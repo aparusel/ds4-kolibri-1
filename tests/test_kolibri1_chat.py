@@ -58,6 +58,18 @@ def ds4_ids(rendered: str) -> list[int]:
     return [int(t) for t in first.strip().strip("[]").split(",")]
 
 
+def ds4_chat_ids(system: str, prompt: str, think_level: int) -> list[int]:
+    """Tokenize a chat prompt rendered by ds4 itself (not the paste path)."""
+    proc = subprocess.run(
+        [DS4, "-m", str(GGUF), "--dump-tokens", "--system", system,
+         "--think-level", str(think_level), "-p", prompt],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ds4 failed: {proc.stderr.strip()}")
+    first = proc.stdout.splitlines()[0]
+    return [int(t) for t in first.strip().strip("[]").split(",")]
+
+
 AGENT_DRIVER = str(ROOT / "tests" / "test_kolibri1_agent_chat")
 SERVER_DRIVER = str(ROOT / "tests" / "test_kolibri1_server_render")
 
@@ -339,6 +351,40 @@ def main() -> int:
             continue
         failures += 1
         print(f"kolibri1-chat: {name:32s} MISMATCH "
+              f"(ds4 {len(got)} vs ref {len(ref_ids)})")
+        for i, (g, r) in enumerate(zip(got, ref_ids)):
+            if g != r:
+                lo = max(0, i - 3)
+                print(f"    first diff at {i}: ds4 "
+                      f"{got[lo:i+3]} ref {ref_ids[lo:i+3]}")
+                break
+        else:
+            print(f"    length differs after {min(len(got), len(ref_ids))}")
+
+    # Numeric --think-level values must select the matching released effort
+    # sentence; level 0 is the flag spelling of nothink (regression: the
+    # engine used to emit the HIGH sentence for 0 while decoding no-think).
+    for level, effort in ((0, "none"), (10, "low"), (40, "medium"),
+                          (80, "high")):
+        system = "You are terse."
+        rendered = template.render(
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": "Hello there"}],
+            add_generation_prompt=True, reasoning_effort=effort)
+        ref_ids = tok.encode(rendered).ids
+        try:
+            got = ds4_chat_ids(system, "Hello there", level)
+        except RuntimeError as exc:
+            failures += 1
+            print(f"kolibri1-chat: {'think-level-'+str(level):32s} "
+                  f"DRIVER FAILED ({exc})")
+            continue
+        if got == ref_ids:
+            print(f"kolibri1-chat: {'think-level-'+str(level):32s} "
+                  f"{len(got):4d} tokens OK")
+            continue
+        failures += 1
+        print(f"kolibri1-chat: {'think-level-'+str(level):32s} MISMATCH "
               f"(ds4 {len(got)} vs ref {len(ref_ids)})")
         for i, (g, r) in enumerate(zip(got, ref_ids)):
             if g != r:
