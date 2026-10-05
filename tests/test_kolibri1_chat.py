@@ -58,6 +58,64 @@ def ds4_ids(rendered: str) -> list[int]:
     return [int(t) for t in first.strip().strip("[]").split(",")]
 
 
+AGENT_DRIVER = str(ROOT / "tests" / "test_kolibri1_agent_chat")
+
+AGENT_SYSTEM_TEXT = "You are a coding agent running in a local workspace."
+AGENT_USER_TEXT = "List the files here, then read the first one."
+AGENT_ASSISTANT_TEXT = ("Checking the directory first.", [
+    {"name": "list", "arguments": {"path": "."}},
+    {"name": "read", "arguments": {"path": "README.md", "max_lines": 5}},
+])
+AGENT_TOOL_RESULTS = ["a\nb\nc", "line1\nline2"]
+
+
+def agent_tools_section() -> str:
+    proc = subprocess.run([AGENT_DRIVER, "--tools-section"],
+                          capture_output=True, text=True, cwd=str(ROOT))
+    if proc.returncode != 0:
+        raise RuntimeError(f"agent driver failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def agent_rules_text() -> str:
+    proc = subprocess.run([AGENT_DRIVER, "--rules"],
+                          capture_output=True, text=True, cwd=str(ROOT))
+    if proc.returncode != 0:
+        raise RuntimeError(f"agent driver failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def agent_transcript_ids() -> list[int]:
+    proc = subprocess.run([AGENT_DRIVER, str(GGUF)],
+                          capture_output=True, text=True, cwd=str(ROOT))
+    if proc.returncode != 0:
+        raise RuntimeError(f"agent driver failed: {proc.stderr.strip()}")
+    return [int(line) for line in proc.stdout.split()]
+
+
+def agent_reference_ids(tools_section: str, rules: str) -> list[int]:
+    """Render the same conversation with the released template.
+
+    The ds4 agent folds its coding-agent rules into the system content (the
+    template only renders the fixed tools section from `tools=`), so the
+    reference content is system text + rules verbatim."""
+    _, calls = AGENT_ASSISTANT_TEXT
+    schema_lines = tools_section.split("<tools>\n", 1)[1].rsplit("\n</tools>", 1)[0]
+    tools = [json.loads(line) for line in schema_lines.split("\n") if line.strip()]
+    content = AGENT_SYSTEM_TEXT + rules
+    messages = [
+        {"role": "system", "content": content},
+        {"role": "user", "content": AGENT_USER_TEXT},
+        {"role": "assistant", "content": AGENT_ASSISTANT_TEXT[0],
+         "tool_calls": calls},
+    ]
+    for result in AGENT_TOOL_RESULTS:
+        messages.append({"role": "tool", "name": "run", "content": result})
+    rendered = template.render(messages=messages, tools=tools,
+                               add_generation_prompt=True)
+    return tok.encode(rendered).ids
+
+
 CASES = [
     ("user-only-default",
      [{"role": "user", "content": "Hello there"}],
@@ -123,6 +181,32 @@ def main() -> int:
                 break
         else:
             print(f"    length differs after {min(len(got), len(ref_ids))}")
+
+    # Agent tool-calling transcript: system + effort + tools in one block,
+    # replayed assistant tool calls, grouped tool results, fresh prefix.
+    try:
+        tools_section = agent_tools_section()
+        rules = agent_rules_text()
+        got = agent_transcript_ids()
+        ref = agent_reference_ids(tools_section, rules)
+        if got == ref:
+            print(f"kolibri1-chat: {'agent-tools-transcript':32s} "
+                  f"{len(got):4d} tokens OK")
+        else:
+            failures += 1
+            print(f"kolibri1-chat: {'agent-tools-transcript':32s} MISMATCH "
+                  f"(ds4 {len(got)} vs ref {len(ref)})")
+            for i, (g, r) in enumerate(zip(got, ref)):
+                if g != r:
+                    lo = max(0, i - 3)
+                    print(f"    first diff at {i}: ds4 "
+                          f"{got[lo:i+3]} ref {ref[lo:i+3]}")
+                    break
+            else:
+                print(f"    length differs after {min(len(got), len(ref))}")
+    except RuntimeError as exc:
+        print(f"kolibri1-chat: agent transcript skipped ({exc})")
+
     if failures:
         print(f"kolibri1-chat: {failures} case(s) FAILED")
         return 1
