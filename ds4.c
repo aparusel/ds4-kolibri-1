@@ -43917,17 +43917,55 @@ static void kolibri_chat_close(const ds4_vocab *vocab, token_vec *out) {
     bpe_tokenize_text(vocab, "\n", out);
 }
 
+/* The system body must be tokenized as ONE span so BPE merges across the
+ * section boundaries exactly like the reference encoder: the rendered text is
+ * content + "\n\n# Reasoning effort\n\n" + sentence (+ "\n\n" + tools), with
+ * no marker splits in between. */
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out);
+static void kolibri_chat_body(const ds4_vocab *vocab, const char *content,
+                              const char *effort, const char *tools,
+                              token_vec *out) {
+    const bool have_system = content && content[0];
+    const bool have_tools = tools && tools[0];
+    size_t n = (have_system ? strlen(content) : 0) +
+               (effort ? strlen(effort) + 24 : 0) +
+               (have_tools ? strlen(tools) + 2 : 0) + 1;
+    char *body = xmalloc(n);
+    size_t pos = 0;
+    if (have_system) {
+        size_t len = strlen(content);
+        memcpy(body + pos, content, len);
+        pos += len;
+    }
+    if (effort) {
+        if (have_system) {
+            body[pos++] = '\n';
+            body[pos++] = '\n';
+        }
+        memcpy(body + pos, "# Reasoning effort\n\n", 20);
+        pos += 20;
+        size_t len = strlen(effort);
+        memcpy(body + pos, effort, len);
+        pos += len;
+    }
+    if (have_tools) {
+        body[pos++] = '\n';
+        body[pos++] = '\n';
+        size_t len = strlen(tools);
+        memcpy(body + pos, tools, len);
+        pos += len;
+    }
+    body[pos] = '\0';
+    tokenize_rendered_chat_vocab(vocab, body, out);
+    free(body);
+}
+
 static void kolibri_chat_system(const ds4_vocab *vocab, const char *system,
                                 ds4_think_mode think_mode, token_vec *out) {
     const char *effort = ds4_kolibri_reasoning_effort_text(think_mode);
-    const bool have_system = system && system[0];
     kolibri_chat_open(vocab, "system", out);
-    if (have_system) bpe_tokenize_text(vocab, system, out);
-    if (effort) {
-        if (have_system) bpe_tokenize_text(vocab, "\n\n", out);
-        bpe_tokenize_text(vocab, "# Reasoning effort\n\n", out);
-        bpe_tokenize_text(vocab, effort, out);
-    }
+    kolibri_chat_body(vocab, system, effort, NULL, out);
     kolibri_chat_close(vocab, out);
 }
 
@@ -44099,12 +44137,51 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 /* Kolibri-1 tool results defer the user turn's <|im_end|> so consecutive
- * results share one turn, as the released template renders them. The flag
- * is per-thread like the other chat builders' scratch state. */
-static __thread bool kolibri_chat_tool_turn_open;
+ * results share one turn, as the released template renders them.  Openness is
+ * derived from the transcript content (the last <|im_start|> without a
+ * following <|im_end|>), because callers rebuild transcripts idempotently:
+ * the agent projects a candidate append to size it, then re-appends on the
+ * real transcript.  A per-call mutable flag would make those two renders
+ * disagree. */
+static bool kolibri_tool_turn_pending(const ds4_vocab *vocab, const token_vec *tokens) {
+    int32_t im_start = vocab->im_start_id;
+    if (im_start < 0) return false;
+    int open_at = -1;
+    for (int i = 0; i < tokens->len; i++) {
+        if (tokens->v[i] == im_start) open_at = i;
+        else if (open_at >= 0 && tokens->v[i] == vocab->im_end_id) open_at = -1;
+    }
+    return open_at >= 0;
+}
+
+/* Kolibri-1 renders the agent's tool definitions inside the same system block
+ * as the effort sentence, exactly as the released template does when the
+ * caller passes tools: after the system text and the "# Reasoning effort"
+ * sentence, a "# Tools" section carries each tool as one JSON object inside
+ * <tools></tools>, followed by the assistant-facing JSON-call instructions.
+ * `tools` is the pre-built section body (schemas + instructions), so the
+ * renderer stays byte-exact without re-deriving wording here. */
+void ds4_chat_append_system_effort_tools(ds4_engine *e, ds4_tokens *tokens,
+                                         const char *system,
+                                         ds4_think_mode think_mode,
+                                         const char *tools) {
+    if (!ds4_model_is_kolibri1()) {
+        /* Families that fold effort elsewhere still want the tools text. */
+        if (system && system[0]) ds4_chat_append_message(e, tokens, "system", system);
+        if (tools && tools[0]) ds4_chat_append_message(e, tokens, "system", tools);
+        return;
+    }
+    ds4_vocab *vocab = &e->vocab;
+    if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+        ds4_die("this tokenizer does not provide the Kolibri chat markers; use raw prompt tokenization");
+    }
+    kolibri_chat_open(vocab, "system", tokens);
+    kolibri_chat_body(vocab, system, ds4_kolibri_reasoning_effort_text(think_mode),
+                      tools, tokens);
+    kolibri_chat_close(vocab, tokens);
+}
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
-    if (ds4_model_is_kolibri1()) kolibri_chat_tool_turn_open = false;
     chat_push_bos_sequence(&e->vocab, tokens);
 }
 
@@ -44115,6 +44192,17 @@ void ds4_encode_chat_prompt(
         ds4_think_mode think_mode,
         ds4_tokens *out) {
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
+}
+
+/* Close the streamed assistant turn.  Kolibri-1's template ends each turn
+ * with <|im_end|> plus a newline; the other families push their EOS token
+ * bare, which is what the agent loop has always done. */
+void ds4_chat_append_assistant_turn_end(ds4_engine *e, ds4_tokens *tokens) {
+    if (ds4_model_is_kolibri1()) {
+        kolibri_chat_close(&e->vocab, tokens);
+        return;
+    }
+    ds4_tokens_push(tokens, ds4_token_eos(e));
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
@@ -44176,19 +44264,11 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (ds4_model_is_kolibri1()) {
         /* Consecutive tool results share one user turn: the closing
          * <|im_end|> is deferred until a non-tool message follows. */
-        if (kolibri_chat_tool_turn_open &&
-            strcmp(role, "tool") && strcmp(role, "function")) {
-            token_vec_push(tokens, vocab->im_end_id);
-            bpe_tokenize_text(vocab, "\n", tokens);
-            kolibri_chat_tool_turn_open = false;
-        }
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            if (!kolibri_chat_tool_turn_open) {
-                token_vec_push(tokens, vocab->im_start_id);
-                bpe_tokenize_text(vocab, "user\n", tokens);
-                kolibri_chat_tool_turn_open = true;
-            } else {
+            if (kolibri_tool_turn_pending(vocab, tokens)) {
                 bpe_tokenize_text(vocab, "\n", tokens);
+            } else {
+                kolibri_chat_open(vocab, "user", tokens);
             }
             token_vec_push(tokens, vocab->tool_response_start_id);
             bpe_tokenize_text(vocab, "\n", tokens);
@@ -44197,9 +44277,16 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             token_vec_push(tokens, vocab->tool_response_end_id);
             return;
         }
+        if (kolibri_tool_turn_pending(vocab, tokens)) {
+            token_vec_push(tokens, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+        }
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
             kolibri_chat_open(vocab, "system", tokens);
-            bpe_tokenize_text(vocab, content, tokens);
+            /* Rendered-chat tokenization: ds4-authored system text carries
+             * tool-call marker spellings that the released tokenizer maps to
+             * their added-token ids. */
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
             kolibri_chat_close(vocab, tokens);
         } else if (!strcmp(role, "assistant")) {
             kolibri_chat_open(vocab, "assistant", tokens);
@@ -44207,7 +44294,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             kolibri_chat_close(vocab, tokens);
         } else {
             kolibri_chat_open(vocab, "user", tokens);
-            bpe_tokenize_text(vocab, content, tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
             kolibri_chat_close(vocab, tokens);
         }
         return;
@@ -44280,10 +44367,9 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     if (ds4_model_is_kolibri1()) {
-        if (kolibri_chat_tool_turn_open) {
+        if (kolibri_tool_turn_pending(&e->vocab, tokens)) {
             token_vec_push(tokens, e->vocab.im_end_id);
             bpe_tokenize_text(&e->vocab, "\n", tokens);
-            kolibri_chat_tool_turn_open = false;
         }
         kolibri_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
