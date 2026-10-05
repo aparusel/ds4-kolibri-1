@@ -42611,6 +42611,12 @@ struct ds4_engine {
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    /* Kolibri sessions borrow the first session's transients the same way;
+     * only the per-session K/V rings and logits stay private. */
+    struct ds4_kolibri1_gpu_graph *kolibri_shared_workspace;
+    uint32_t kolibri_arena_users;
+#endif
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
@@ -59960,26 +59966,54 @@ static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
     return true;
 }
 
+/* Transients a session can borrow from the engine arena.  The per-session
+ * K/V rings and the logits row are not in the list. */
+#define DS4_KOLIBRI1_SCRATCH_FIELDS(X) \
+    X(R) X(x) X(blk) X(attn_o) X(moe_out) X(q) X(kv) X(attn_part) \
+    X(router) X(selected) X(rweights) X(mid) X(part)
+
 static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
     if (!g) return;
-    ds4_gpu_tensor *owned[] = {
-        g->R, g->x, g->blk, g->attn_o, g->moe_out, g->logits, g->q, g->kv,
-        g->attn_part, g->router, g->selected, g->rweights, g->mid, g->part,
-    };
     if (g->owns_scratch) {
-        for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
-            ds4_gpu_tensor_free(owned[i]);
-        }
+#define DS4_KOLIBRI1_SCRATCH_FREE(field_) ds4_gpu_tensor_free(g->field_);
+        DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_FREE)
+#undef DS4_KOLIBRI1_SCRATCH_FREE
+        free(g->host_row);
     }
+    /* The logits row and the K/V rings are always private to the session. */
+    ds4_gpu_tensor_free(g->logits);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_k_cache[il]);
         ds4_gpu_tensor_free(g->layer_v_cache[il]);
         g->layer_k_cache[il] = NULL;
         g->layer_v_cache[il] = NULL;
     }
-    if (g->owns_scratch) free(g->host_row);
     g->host_row = NULL;
     memset(g, 0, sizeof(*g));
+}
+
+/* Move the transients out of the first session and into the engine, which
+ * then outlives every session and lends them to the next ones.  The session
+ * keeps using the same buffers; only ownership moves. */
+static void kolibri1_graph_transfer_scratch(ds4_kolibri1_gpu_graph *dst, ds4_kolibri1_gpu_graph *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->ctx_cap = src->ctx_cap;
+    dst->cap_tokens = src->cap_tokens;
+    dst->slide_rows = src->slide_rows;
+#define DS4_KOLIBRI1_SCRATCH_TAKE(field_) dst->field_ = src->field_;
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_TAKE)
+#undef DS4_KOLIBRI1_SCRATCH_TAKE
+    dst->host_row = src->host_row;
+    dst->owns_scratch = true;
+    src->owns_scratch = false;
+}
+
+static uint64_t kolibri1_graph_scratch_bytes(const ds4_kolibri1_gpu_graph *g) {
+    uint64_t total = 0;
+#define DS4_KOLIBRI1_SCRATCH_COUNT(field_) total += ds4_gpu_tensor_bytes(g->field_);
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_COUNT)
+#undef DS4_KOLIBRI1_SCRATCH_COUNT
+    return total;
 }
 
 static ds4_gpu_tensor *kolibri1_graph_alloc_f32(uint64_t n) {
@@ -73909,6 +73943,13 @@ void ds4_engine_close(ds4_engine *e) {
         e->qwen4_shared_workspace = NULL;
     }
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (e->kolibri_shared_workspace) {
+        kolibri1_graph_free(e->kolibri_shared_workspace);
+        free(e->kolibri_shared_workspace);
+        e->kolibri_shared_workspace = NULL;
+    }
+#endif
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
@@ -74233,12 +74274,37 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : kolibri1_prefill_chunk_tokens((uint32_t)ctx_size);
-        if (!kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, NULL)) {
+        /* One arena of transients serves every server session; each session
+         * still owns its K/V rings and logits.  A wider arena replaces the
+         * shared one when no live session borrows it. */
+        const bool share = e->share_session_prefill_workspace &&
+                           e->backend == DS4_BACKEND_METAL;
+        const bool arena_fits = e->kolibri_shared_workspace &&
+            e->kolibri_shared_workspace->cap_tokens >= cap_tokens;
+        if (share && e->kolibri_shared_workspace && !arena_fits &&
+            e->kolibri_arena_users == 0) {
+            kolibri1_graph_free(e->kolibri_shared_workspace);
+            free(e->kolibri_shared_workspace);
+            e->kolibri_shared_workspace = NULL;
+        }
+        const ds4_kolibri1_gpu_graph *shared =
+            share && arena_fits ? e->kolibri_shared_workspace : NULL;
+        if (!kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, shared)) {
             free(s);
             return 1;
         }
+        if (share && !e->kolibri_shared_workspace) {
+            e->kolibri_shared_workspace = xcalloc(1, sizeof(*e->kolibri_shared_workspace));
+            const uint64_t arena = kolibri1_graph_scratch_bytes(&s->kolibri_gpu);
+            kolibri1_graph_transfer_scratch(e->kolibri_shared_workspace, &s->kolibri_gpu);
+            fprintf(stderr,
+                    "ds4: shared Kolibri-1 session transients: cap=%u, %.2f GiB once; "
+                    "each further session costs its caches only\n",
+                    cap_tokens, (double)arena / (1024.0 * 1024.0 * 1024.0));
+        }
         kolibri1_graph_reset(&s->kolibri_gpu);
         s->kolibri_graph_ready = true;
+        if (!s->kolibri_gpu.owns_scratch) e->kolibri_arena_users++;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -74611,6 +74677,9 @@ void ds4_session_free(ds4_session *s) {
 #endif
 #ifdef DS4_HAS_KOLIBRI1_METAL
         if (ds4_session_is_kolibri1(s)) {
+            if (s->kolibri_graph_ready && !s->kolibri_gpu.owns_scratch && s->engine) {
+                s->engine->kolibri_arena_users--;
+            }
             kolibri1_graph_free(&s->kolibri_gpu);
         } else
 #endif
