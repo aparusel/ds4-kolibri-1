@@ -84,6 +84,7 @@ def anthropic_tool_schema():
 
 def smoke(base, model):
     ids = [m["id"] for m in post(base, "/v1/models", None)["data"]]
+    assert "kolibri-1" in ids, ids
     model = model or ids[0]
     print(f"models: {ids}; using {model}")
 
