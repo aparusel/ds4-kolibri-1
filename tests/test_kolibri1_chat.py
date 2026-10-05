@@ -127,6 +127,17 @@ def server_rendered(body: dict, effort: str) -> str:
     return proc.stdout
 
 
+def server_live_tail(body: dict, effort: str, start: int) -> str:
+    """Render the live tool tail for a session mid tool round."""
+    proc = subprocess.run([SERVER_DRIVER, "--effort", effort,
+                           "--live-tail", str(start)],
+                          input=json.dumps(body), capture_output=True, text=True,
+                          cwd=str(ROOT))
+    if proc.returncode != 0:
+        raise RuntimeError(f"server render driver failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
 SERVER_TOOLS = [{"type": "function", "function": {
     "name": "ls", "parameters": {"type": "object", "properties": {
         "path": {"type": "string"}}}}}]
@@ -201,6 +212,71 @@ def run_server_cases() -> int:
                 lo = max(0, i - 25)
                 print(f"    first diff at {i}:\n    driver {got[lo:i+25]!r}\n"
                       f"    ref    {rendered[lo:i+25]!r}")
+                break
+        else:
+            print("    length differs after the common prefix")
+    return failures
+
+
+# Mid tool-round continuation: the assistant turn is already sampled in the
+# live KV, so the tail after the assistant end token must be exactly the
+# template's bytes from that boundary on (grouped tool results + the next
+# generation prefix).
+SERVER_LIVE_TAIL_BODY = {
+    "messages": [
+        {"role": "user", "content": "check both"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "id": "call_1", "function": {
+                "name": "ls", "arguments": "{\"path\": \".\"}"}},
+            {"type": "function", "id": "call_2", "function": {
+                "name": "cat", "arguments": "{\"path\": \"a b/c\"}"}}]},
+        {"role": "tool", "content": "a\nb"},
+        {"role": "tool", "content": "line1"},
+    ],
+    "tools": SERVER_TOOLS,
+}
+
+
+def run_server_live_tail_cases() -> int:
+    """Gate render_live_tool_tail_for_syntax against the released template.
+
+    The live KV of a tool-call turn ends before the assistant end token; the
+    tail must therefore equal the full render sliced just before it."""
+    failures = 0
+    body = SERVER_LIVE_TAIL_BODY
+    messages = body["messages"]
+    start = next(i for i, m in enumerate(messages) if m["role"] == "tool")
+    marker = "<|im_end|>\n"
+    for effort in ("high", "none"):
+        full = server_rendered(body, effort)
+        try:
+            tail = server_live_tail(body, effort, start)
+        except RuntimeError as exc:
+            failures += 1
+            print(f"kolibri1-chat: {'server-live-tool-tail-'+effort:32s} DRIVER FAILED ({exc})")
+            continue
+        prefix = template.render(messages=messages[:start],
+                                 tools=body.get("tools"),
+                                 add_generation_prompt=False,
+                                 reasoning_effort=effort)
+        if not prefix.endswith(marker):
+            failures += 1
+            print(f"kolibri1-chat: {'server-live-tool-tail-'+effort:32s} "
+                  "reference prefix does not close the assistant turn")
+            continue
+        expected = full[len(prefix) - len(marker):]
+        if tail == expected:
+            print(f"kolibri1-chat: {'server-live-tool-tail-'+effort:32s} "
+                  f"{len(tail):4d} chars OK")
+            continue
+        failures += 1
+        print(f"kolibri1-chat: {'server-live-tool-tail-'+effort:32s} MISMATCH "
+              f"(driver {len(tail)} vs ref {len(expected)})")
+        for i, (g, r) in enumerate(zip(tail, expected)):
+            if g != r:
+                lo = max(0, i - 25)
+                print(f"    first diff at {i}:\n    driver {tail[lo:i+25]!r}\n"
+                      f"    ref    {expected[lo:i+25]!r}")
                 break
         else:
             print("    length differs after the common prefix")
@@ -301,6 +377,7 @@ def main() -> int:
     # Server renderer: the ds4-server prompt text must byte-match the
     # released template for request-shaped conversations.
     failures += run_server_cases()
+    failures += run_server_live_tail_cases()
 
     if failures:
         print(f"kolibri1-chat: {failures} case(s) FAILED")

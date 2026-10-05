@@ -22,6 +22,7 @@ static char *render_driver_read_stdin(void) {
 
 int main(int argc, char **argv) {
     ds4_think_mode mode = DS4_THINK_HIGH;
+    int live_tail_start = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--effort") && i + 1 < argc) {
             const char *e = argv[++i];
@@ -33,6 +34,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "render driver: unknown effort %s\n", e);
                 return 2;
             }
+        } else if (!strcmp(argv[i], "--live-tail") && i + 1 < argc) {
+            live_tail_start = atoi(argv[++i]);
         } else {
             fprintf(stderr, "render driver: unknown argument %s\n", argv[i]);
             return 2;
@@ -83,6 +86,14 @@ int main(int argc, char **argv) {
         }
     }
     if (*p != '}') goto bad;
+
+    if (live_tail_start >= 0) {
+        char *tail = render_live_tool_tail_for_syntax(
+            SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, live_tail_start, &orders, mode);
+        if (!tail) goto bad;
+        fputs(tail, stdout);
+        return 0;
+    }
 
     char *rendered = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, schemas, &orders, mode);
