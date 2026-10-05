@@ -7064,6 +7064,181 @@ static bool qwen_param_declared_string(const tool_schema_orders *orders,
     return false;
 }
 
+/* Parse a Kolibri-1 JSON call object starting at '{'. Interpreted keys:
+ * "name" (string) and "arguments" (an object literal kept as raw text, or a
+ * JSON-encoded string decoded to its inner text). Unknown keys are skipped.
+ * Returns the position after '}' via *pp, or false on malformed input. */
+static bool parse_kolibri_call_object(const char **pp,
+                                      char **name_out,
+                                      char **args_out,
+                                      bool *have_args_out) {
+    const char *p = *pp;
+    *name_out = NULL;
+    *args_out = NULL;
+    *have_args_out = false;
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        json_ws(&p);
+        if (!strcmp(key, "name")) {
+            char *name = NULL;
+            if (!json_string(&p, &name)) {
+                free(key);
+                return false;
+            }
+            free(*name_out);
+            *name_out = name;
+        } else if (!strcmp(key, "arguments")) {
+            if (*p == '"') {
+                char *decoded = NULL;
+                if (!json_string(&p, &decoded)) {
+                    free(key);
+                    return false;
+                }
+                free(*args_out);
+                *args_out = decoded;
+            } else {
+                char *raw = NULL;
+                if (!json_raw_value(&p, &raw)) {
+                    free(key);
+                    return false;
+                }
+                free(*args_out);
+                *args_out = raw;
+            }
+            *have_args_out = true;
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+        }
+    }
+    if (*p != '}') return false;
+    p++;
+    *pp = p;
+    return true;
+}
+
+/* Generated-text parser for the released Kolibri template. The server works
+ * on whole text here (no incremental parsing): split the think block, then
+ * parse back-to-back JSON call stanzas after it. Calls inside reasoning are
+ * model text and never executable, mirroring the other families. */
+
+/* The template puts "\n</think>\n\n" between reasoning and answer and strips
+ * newlines from both sides of the reasoning. */
+static void kolibri_trim_split(char **content_out, char **reasoning_out) {
+    qwen_trim_split(content_out, reasoning_out);
+    if (reasoning_out && *reasoning_out) {
+        const char *r = *reasoning_out;
+        while (*r == '\n') r++;
+        if (r != *reasoning_out) {
+            char *trimmed = xstrdup(r);
+            free(*reasoning_out);
+            *reasoning_out = trimmed;
+        }
+    }
+}
+
+static bool parse_kolibri_generated_message_ex(const char *text,
+                                               bool require_thinking_closed,
+                                               char **content_out,
+                                               char **reasoning_out,
+                                               tool_calls *calls) {
+    static const char tool_start[] = "<tool" "_call>";
+    static const char tool_end[] = "</tool" "_call>";
+    text = text ? text : "";
+    const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
+    if (require_thinking_closed) {
+        const char *think_end = find_tool_structural_text(text, "</think>", true);
+        if (!think_end) {
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete Kolibri tool calls in reasoning\n");
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
+        }
+    }
+
+    const char *start = strstr(tool_search, tool_start);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        kolibri_trim_split(content_out, reasoning_out);
+        return true;
+    }
+    const char *raw_block_start = start;
+    while (raw_block_start > text &&
+           (raw_block_start[-1] == '\n' || raw_block_start[-1] == ' '))
+        raw_block_start--;
+    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(raw_block_start - text));
+
+    const char *p = start;
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
+        p += strlen(tool_start);
+        p = skip_ascii_ws(p);
+        char *name = NULL, *args = NULL;
+        bool have_args = false;
+        if (!parse_kolibri_call_object(&p, &name, &args, &have_args)) {
+            free(name);
+            free(args);
+            tool_calls_free(calls);
+            return false;
+        }
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_end, strlen(tool_end)) != 0) {
+            free(name);
+            free(args);
+            tool_calls_free(calls);
+            return false;
+        }
+        p += strlen(tool_end);
+        tool_call tc = {0};
+        tc.name = name ? name : xstrdup("");
+        tc.arguments = have_args && args ? args : xstrdup("{}");
+        tool_calls_push(calls, tc);
+
+        const char *next = skip_ascii_ws(p);
+        if (strncmp(next, tool_start, strlen(tool_start)) != 0) {
+            p = next;
+            break;
+        }
+        p = next;
+    }
+
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(raw_block_start, (size_t)(p - raw_block_start));
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len, content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
+    /* The template puts "\n</think>\n\n" between reasoning and answer. */
+    kolibri_trim_split(content_out, reasoning_out);
+    return true;
+}
+
 static bool parse_qwen_generated_message_ex(const char *text,
                                             bool require_thinking_closed,
                                             char **content_out,
@@ -7220,6 +7395,10 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out, calls, NULL);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return parse_kolibri_generated_message_ex(text, require_thinking_closed,
+                                                  content_out, reasoning_out, calls);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -19087,6 +19266,119 @@ static void test_render_kolibri_chat_prompt_text(void) {
     chat_msgs_free(&embedded);
 }
 
+static void test_parse_kolibri_generated_message_ex(void) {
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+
+    /* Closed think block: reasoning and content split at the template's
+     * "\n</think>\n\n" separator. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "<think>\n2+2\n</think>\n\nThe answer is 4.", true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "2+2"));
+    TEST_ASSERT(content && !strcmp(content, "The answer is 4."));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+
+    /* One call with an object-literal arguments value, kept raw. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "checking\n<tool" "_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n"
+        "</tool" "_call>", false, &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "checking"));
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 1);
+    if (calls.len == 1) {
+        TEST_ASSERT(!strcmp(calls.v[0].name, "ls"));
+        TEST_ASSERT(!strcmp(calls.v[0].arguments, "{\"path\": \".\"}"));
+    }
+    TEST_ASSERT(calls.raw_tool_text != NULL &&
+                strstr(calls.raw_tool_text, "\"name\": \"ls\"") != NULL);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* Arguments as a JSON-encoded string decode to the inner text; key order
+     * does not matter and unknown keys are skipped. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "<tool" "_call>\n{\"note\": 1, \"arguments\": \"{\\\"path\\\": \\\".\\\"}\", "
+        "\"name\": \"read\"}\n</tool" "_call>", false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    if (calls.len == 1) {
+        TEST_ASSERT(!strcmp(calls.v[0].name, "read"));
+        TEST_ASSERT(!strcmp(calls.v[0].arguments, "{\"path\": \".\"}"));
+    }
+    TEST_ASSERT(content && !strcmp(content, ""));
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* Back-to-back stanzas; a missing arguments member is an empty call. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "go\n<tool" "_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool" "_call>"
+        "\n<tool" "_call>\n{\"name\": \"b\"}\n</tool" "_call>", false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "go"));
+    TEST_ASSERT(calls.len == 2);
+    if (calls.len == 2) {
+        TEST_ASSERT(!strcmp(calls.v[0].name, "a"));
+        TEST_ASSERT(!strcmp(calls.v[1].name, "b"));
+        TEST_ASSERT(!strcmp(calls.v[1].arguments, "{}"));
+    }
+    TEST_ASSERT(calls.raw_tool_text != NULL &&
+                strstr(calls.raw_tool_text, "\"name\": \"b\"") != NULL);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* A complete call inside a closed think block is quoted protocol text,
+     * not executable; the answer after the block parses normally. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "<think>\ntry <tool" "_call>\n{\"name\":\"x\",\"arguments\":{}}\n</tool" "_call>"
+        "\n</think>\nfinal", true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(content && !strcmp(content, "final"));
+    TEST_ASSERT(reasoning && strstr(reasoning, "\"name\":\"x\"") != NULL);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+
+    /* Unterminated reasoning followed by a complete call recovers per the
+     * shared rule: reasoning holds the prefix, content is empty. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "thinking...\n\n<tool" "_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool" "_call>",
+        true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(content && !strcmp(content, ""));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "thinking..."));
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* Plain answer without thinking: content only, no calls. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "plain answer", false, &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "plain answer"));
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+
+    /* Malformed stanza: parse fails, partial calls are dropped. */
+    TEST_ASSERT(!parse_kolibri_generated_message_ex(
+        "x<tool" "_call>\n{\"name\": \"a\", \"arguments\": }\n</tool" "_call>", false,
+        &content, &reasoning, &calls));
+    free(content);
+    free(reasoning);
+}
+
 static void test_render_qwen_chat_prompt_text(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -23710,6 +24002,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
     test_render_kolibri_chat_prompt_text();
+    test_parse_kolibri_generated_message_ex();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
