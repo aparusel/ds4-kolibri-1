@@ -62336,6 +62336,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
+    if (ds4_session_is_kolibri1(s)) return 0;
     if (ds4_session_is_cpu(s)) return 0;
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU
@@ -62405,6 +62406,10 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
+        return 1;
+    }
+    if (ds4_session_is_kolibri1(s)) {
+        payload_set_err(err, errlen, "distributed layer payloads are not supported for Kolibri-1");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -62673,6 +62678,10 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
+        return 1;
+    }
+    if (ds4_session_is_kolibri1(s)) {
+        payload_set_err(err, errlen, "distributed layer payloads are not supported for Kolibri-1");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -63435,6 +63444,270 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     return rc;
 }
 #endif
+
+/* Kolibri-1 session payload: header, checkpoint tokens, logits, then the live
+ * K/V rows of every layer in logical position order.  The GPU graph keeps
+ * full-layer rows at absolute positions and a sliding ring (row = pos %
+ * slide_rows); the CPU reference keeps full layers absolute and slides a
+ * compacted window.  Storing logical rows lets the loader rebuild whichever
+ * physical layout the current session uses.  A zero slide_rows header field
+ * marks the CPU layout, so a ring payload is never restored as a compacted
+ * window or the reverse.  The header's tag keeps payloads from other
+ * families out and the geometry fields reject shape mismatches. */
+#define DS4_KOLIBRI1_PAYLOAD_TAG UINT32_C(0x4b314b02) /* "K1K2" little-endian */
+
+static uint32_t kolibri1_payload_live_rows(bool full, uint32_t tokens,
+                                           uint32_t ctx_rows, uint32_t slide_rows) {
+    const uint32_t rows = full ? ctx_rows : slide_rows;
+    return tokens < rows ? tokens : rows;
+}
+
+static uint64_t kolibri1_payload_body_bytes(const ds4_session *s, uint32_t tokens) {
+    uint32_t ctx_rows = s->kolibri1_cpu.ctx;
+    uint32_t slide_rows = DS4_N_SWA;
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_session_kolibri_uses_gpu(s)) {
+        ctx_rows = s->kolibri_gpu.ctx_cap;
+        slide_rows = s->kolibri_gpu.slide_rows;
+    }
+#endif
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    uint64_t bytes = (uint64_t)tokens * sizeof(uint32_t) +
+                     (uint64_t)DS4_N_VOCAB * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t live = kolibri1_payload_live_rows(ds4_kolibri1_layer_is_full(il),
+                                                         tokens, ctx_rows, slide_rows);
+        bytes += (uint64_t)live * kv_row * 2u;
+    }
+    return bytes;
+}
+
+static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    const bool gpu = ds4_session_kolibri_uses_gpu(s);
+    const uint32_t tokens = (uint32_t)s->checkpoint.len;
+    uint32_t ctx_rows = s->kolibri1_cpu.ctx;
+    uint32_t slide_rows = DS4_N_SWA;
+    uint32_t saved_slide = 0;
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (!s->kolibri_graph_ready || s->kolibri_gpu.pos != tokens) {
+            payload_set_err(err, errlen, "Kolibri-1 graph has no complete frontier to save");
+            return 1;
+        }
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to synchronize accelerator before Kolibri-1 snapshot");
+            return 1;
+        }
+        ctx_rows = s->kolibri_gpu.ctx_cap;
+        slide_rows = s->kolibri_gpu.slide_rows;
+        saved_slide = slide_rows;
+#else
+        payload_set_err(err, errlen, "graph backend support is not compiled in");
+        return 1;
+#endif
+    } else if (!s->kolibri1_cpu.ctx || s->kolibri1_cpu.filled != tokens) {
+        payload_set_err(err, errlen, "Kolibri-1 CPU cache has no complete frontier to save");
+        return 1;
+    }
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        (uint32_t)s->ctx_size,
+        s->prefill_cap,
+        ctx_rows,
+        saved_slide,
+        DS4_N_SWA,
+        tokens,
+        DS4_N_LAYER,
+        DS4_N_HEAD_DIM,
+        DS4_N_HEAD_KV,
+        DS4_N_VOCAB,
+        DS4_KOLIBRI1_PAYLOAD_TAG,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+    }
+    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const bool full = ds4_kolibri1_layer_is_full(il);
+        const uint32_t live = kolibri1_payload_live_rows(full, tokens, ctx_rows, slide_rows);
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (gpu) {
+            const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
+            for (uint32_t r = 0; rc == 0 && r < live; r++) {
+                const uint32_t pos = tokens - live + r;
+                const uint32_t phys = full ? pos : pos % slide_rows;
+                const uint64_t offset = (uint64_t)phys * kv_row;
+                rc = payload_write_tensor_span(fp, g->layer_k_cache[il], offset, kv_row,
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) {
+                    rc = payload_write_tensor_span(fp, g->layer_v_cache[il], offset, kv_row,
+                                                   buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                }
+            }
+            continue;
+        }
+#endif
+        const ds4_kolibri1_kv_layer *layer = &s->kolibri1_cpu.layer[il];
+        rc = payload_write_bytes(fp, layer->k, (uint64_t)live * kv_row, err, errlen);
+        if (rc == 0) {
+            rc = payload_write_bytes(fp, layer->v, (uint64_t)live * kv_row, err, errlen);
+        }
+    }
+    free(buf);
+    return rc;
+}
+
+static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
+                                 uint64_t *remaining, char *err, size_t errlen) {
+    const bool gpu = ds4_session_kolibri_uses_gpu(s);
+    const uint32_t saved_ctx = h[2];
+    const uint32_t saved_ctx_rows = h[4];
+    const uint32_t saved_slide = h[5];
+    const uint32_t saved_tokens = h[7];
+    if (h[12] != DS4_KOLIBRI1_PAYLOAD_TAG || h[6] != DS4_N_SWA ||
+        h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+        h[10] != DS4_N_HEAD_KV || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size ||
+        saved_ctx_rows == 0 || saved_ctx_rows > saved_ctx ||
+        saved_tokens > saved_ctx_rows) {
+        payload_set_err(err, errlen, "KV checkpoint does not fit current context");
+        return 1;
+    }
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
+        /* A ring smaller than the window is only valid when the context
+         * itself is smaller than the window (all positions fit, so the file
+         * covers the whole history). */
+        const bool ring_ok = saved_ctx_rows <= DS4_N_SWA
+            ? saved_slide == saved_ctx_rows
+            : saved_slide > DS4_N_SWA;
+        if (!s->kolibri_graph_ready || !ring_ok ||
+            kolibri1_payload_live_rows(false, saved_tokens, saved_ctx_rows, saved_slide) >
+                g->slide_rows) {
+            payload_set_err(err, errlen, "KV checkpoint Kolibri-1 ring layout does not match current runtime");
+            return 1;
+        }
+#else
+        payload_set_err(err, errlen, "graph backend support is not compiled in");
+        return 1;
+#endif
+    } else if (saved_slide != 0 || !s->kolibri1_cpu.ctx) {
+        payload_set_err(err, errlen, saved_slide != 0
+            ? "KV checkpoint was written by the Kolibri-1 GPU runtime"
+            : "Kolibri-1 CPU cache is not initialized");
+        return 1;
+    }
+    /* The CPU layout has no ring field; its sliding layers hold one window. */
+    const uint32_t load_slide = gpu ? saved_slide : DS4_N_SWA;
+
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < saved_tokens; i++) {
+        uint32_t token = 0;
+        if (payload_read_u32(fp, &token, remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (token >= DS4_N_VOCAB) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen, "invalid Kolibri-1 snapshot token");
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)token);
+    }
+    /* From the first write onward, failure must leave no reusable checkpoint. */
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+                           remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        s->checkpoint.len = 0;
+        return 1;
+    }
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (ds4_gpu_synchronize() == 0) {
+            token_vec_free(&new_checkpoint);
+            s->checkpoint.len = 0;
+            payload_set_err(err, errlen, "failed to synchronize accelerator before Kolibri-1 restore");
+            return 1;
+        }
+#endif
+    }
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const bool full = ds4_kolibri1_layer_is_full(il);
+        const uint32_t live = kolibri1_payload_live_rows(full, saved_tokens,
+                                                         saved_ctx_rows, load_slide);
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (gpu) {
+            ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
+            for (uint32_t r = 0; rc == 0 && r < live; r++) {
+                const uint32_t pos = saved_tokens - live + r;
+                const uint32_t phys = full ? pos : pos % g->slide_rows;
+                const uint64_t offset = (uint64_t)phys * kv_row;
+                rc = payload_read_tensor_span(fp, g->layer_k_cache[il], offset, kv_row,
+                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0) {
+                    rc = payload_read_tensor_span(fp, g->layer_v_cache[il], offset, kv_row,
+                                                  buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                }
+            }
+            continue;
+        }
+#endif
+        ds4_kolibri1_kv_layer *layer = &s->kolibri1_cpu.layer[il];
+        rc = payload_read_bytes(fp, layer->k, (uint64_t)live * kv_row, remaining, err, errlen);
+        if (rc == 0) {
+            rc = payload_read_bytes(fp, layer->v, (uint64_t)live * kv_row, remaining, err, errlen);
+        }
+    }
+    free(buf);
+    if (rc == 0 && *remaining != 0) {
+        payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
+        rc = 1;
+    }
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        s->checkpoint.len = 0;
+        ds4_session_dspark_capture_invalidate(s);
+        if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+            kolibri1_graph_reset(&s->kolibri_gpu);
+#endif
+        } else {
+            s->kolibri1_cpu.filled = 0;
+        }
+        return 1;
+    }
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        s->kolibri_gpu.pos = saved_tokens;
+#endif
+    } else {
+        s->kolibri1_cpu.filled = saved_tokens;
+    }
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_invalidate(s);
+    return 0;
+}
+
 #ifdef DS4_HAS_QWEN4_GPU
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
@@ -63465,6 +63738,22 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
                ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
     }
 #endif
+    if (ds4_session_is_kolibri1(s)) {
+        const bool gpu = ds4_session_kolibri_uses_gpu(s);
+        if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+            if (!s->kolibri_graph_ready ||
+                s->kolibri_gpu.pos != (uint32_t)s->checkpoint.len) return 0;
+#else
+            return 0;
+#endif
+        } else if (!s->kolibri1_cpu.ctx ||
+                   s->kolibri1_cpu.filled != (uint32_t)s->checkpoint.len) {
+            return 0;
+        }
+        return (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+               kolibri1_payload_body_bytes(s, (uint32_t)s->checkpoint.len);
+    }
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -63835,6 +64124,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
+    if (ds4_session_is_kolibri1(s)) return kolibri1_save_payload(s, fp, err, errlen);
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -64222,6 +64512,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
+    if (ds4_session_is_kolibri1(s)) return kolibri1_load_payload(s, fp, h, &remaining, err, errlen);
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
