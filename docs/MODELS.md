@@ -149,7 +149,7 @@ pass it at runtime with `--vision`.
 Kolibri-1 is Aleph Alpha's 78.10B-parameter mixture-of-experts model with
 3.46B active parameters (Apache 2.0). Prebuilt Q8, Q4 and Q2 GGUFs with
 published SHA-256 checksums are on
-[aparusel/kolibri-1-gguf](https://huggingface.co/aparusel/kolibri-1-gguf);
+[aparusel/ds4-kolibri-1-gguf](https://huggingface.co/aparusel/ds4-kolibri-1-gguf);
 `download_model.sh` fetches them into `gguf/` and verifies size and checksum.
 The `--quant` flag selects the routed-expert format when building locally:
 

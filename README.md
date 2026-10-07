@@ -13,7 +13,7 @@ and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
 **Kolibri-1** (Metal and CPU), Aleph Alpha's German/English mixture-of-experts
 model. Kolibri-1 is the smallest model in the family, so it is the most
 accessible entry point: prebuilt Q8, Q4, and Q2 GGUFs are on
-[Hugging Face](https://huggingface.co/aparusel/kolibri-1-gguf). The code is
+[Hugging Face](https://huggingface.co/aparusel/ds4-kolibri-1-gguf). The code is
 self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
@@ -236,7 +236,7 @@ weights.
 
 Prebuilt Q8, Q4, and Q2 GGUFs, converted from the FP8 release with a pinned
 source revision and SHA-256 checksums, are on
-[Hugging Face](https://huggingface.co/aparusel/kolibri-1-gguf); the
+[Hugging Face](https://huggingface.co/aparusel/ds4-kolibri-1-gguf); the
 `download_model.sh` targets fetch them into `gguf/` and verify the checksums:
 
 ```sh
